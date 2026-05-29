@@ -206,6 +206,11 @@ class TaskCreate(BaseModel):
     timeout: int = Field(default=7200, ge=10, le=86400)
     floating_emoji: bool = False
     participant_reactions: bool = False
+    # v8.4: reaction interval (seconds). Worker picks random delay in [min,max]
+    # between successive emoji clicks. Only used if participant_reactions OR
+    # floating_emoji is True.
+    reaction_interval_min: int = Field(default=30, ge=5, le=3600)
+    reaction_interval_max: int = Field(default=90, ge=5, le=3600)
     scheduled_at: Optional[str] = None   # ISO string (IST input but stored as UTC)
 
 
@@ -220,6 +225,8 @@ class TaskOut(BaseModel):
     timeout: int
     floating_emoji: bool
     participant_reactions: bool
+    reaction_interval_min: int = 30
+    reaction_interval_max: int = 90
     status: str  # scheduled | active | completed | failed | cancelled
     scheduled_at: Optional[str] = None
     started_at: Optional[str] = None
@@ -427,6 +434,8 @@ def _task_from_doc(d: dict) -> dict:
         "timeout": d["timeout"],
         "floating_emoji": d.get("floating_emoji", False),
         "participant_reactions": d.get("participant_reactions", False),
+        "reaction_interval_min": d.get("reaction_interval_min", 30),
+        "reaction_interval_max": d.get("reaction_interval_max", 90),
         "status": d["status"],
         "scheduled_at": d.get("scheduled_at"),
         "started_at": d.get("started_at"),
@@ -495,6 +504,8 @@ async def create_task(payload: TaskCreate, user: dict = Depends(get_current_user
         "timeout": payload.timeout,
         "floating_emoji": payload.floating_emoji,
         "participant_reactions": payload.participant_reactions,
+        "reaction_interval_min": int(payload.reaction_interval_min),
+        "reaction_interval_max": int(max(payload.reaction_interval_max, payload.reaction_interval_min)),
         "status": status,
         "scheduled_at": sched.isoformat() if sched else None,
         "started_at": started_at.isoformat() if started_at else None,
@@ -850,7 +861,13 @@ async def worker_chunk_status(task_id: str, w: dict = Depends(get_current_worker
 
 
 # Distribution mode:
-#   "auto"   (default, recommended) — auto-detects best strategy:
+#   "round_robin" (default v8.4) — WAVE-BASED EVEN FILL. Each worker is capped
+#              at ceil((task.members_claimed + 1) / online_count) bots per
+#              task at any moment. Result: with 30 RDPs online, the FIRST 30
+#              bots are assigned 1 per RDP (wave 1); next 30 bring each RDP to
+#              2 bots (wave 2); etc. Guarantees no RDP receives a 2nd bot
+#              until every other RDP has its 1st.
+#   "auto"   — auto-detects best strategy:
 #              • If all online RDPs have the SAME effective capacity (homogeneous
 #                fleet → typical user case: 30 identical RDPs), it does a strict
 #                EQUAL split: each RDP gets ceil(members / online_count) bots.
@@ -861,7 +878,10 @@ async def worker_chunk_status(task_id: str, w: dict = Depends(get_current_worker
 #   "even"     — always strict equal split (ignores capacity).
 #   "greedy"   — old behaviour: one RDP fills up before the next gets anything.
 # Switch via env var DISTRIBUTION_MODE on backend .env.
-DISTRIBUTION_MODE = os.environ.get("DISTRIBUTION_MODE", "auto").lower()
+DISTRIBUTION_MODE = os.environ.get("DISTRIBUTION_MODE", "round_robin").lower()
+# v8.4: hard cap on bots a single worker can take per claim cycle in round_robin
+# mode. Keeps the wave pattern visible even when one worker polls 3x faster.
+ROUND_ROBIN_TAKE_PER_CYCLE = int(os.environ.get("ROUND_ROBIN_TAKE_PER_CYCLE", "1"))
 
 
 @api.post("/workers/me/claim")
@@ -953,9 +973,25 @@ async def worker_claim_tasks(
         if DISTRIBUTION_MODE == "weighted":
             fair_share_total = weighted_share
         else:
-            # auto / even / anything else → strict equal split. We also clamp
-            # by capacity_left so a small RDP never gets more than it can hold.
+            # auto / even / round_robin / anything else → strict equal split.
+            # We also clamp by capacity_left so a small RDP never gets more
+            # than it can hold.
             fair_share_total = equal_share
+
+        # v8.4: ROUND-ROBIN / WAVE OVERLAY
+        # In round_robin mode we OVERRIDE fair_share_total with a wave cap that
+        # depends on how many bots have already been claimed across the fleet.
+        # wave_cap = ceil((already_claimed_total + 1) / online_count)
+        # → Wave 1: each worker max 1 bot (until all `online_count` claimed).
+        # → Wave 2: each worker max 2 bots (until 2×online_count claimed).
+        # → ... and so on. Gives a clean visual: every RDP joins 1 first.
+        rr_take_cap = None
+        if DISTRIBUTION_MODE == "round_robin":
+            wave_cap = math.ceil((old_claimed + 1) / online_count)
+            fair_share_total = wave_cap
+            # Also clamp the per-cycle take so one worker can't grab 5+ bots
+            # at once and break the wave pattern.
+            rr_take_cap = max(1, ROUND_ROBIN_TAKE_PER_CYCLE)
 
         # Guarantee at least 1 bot per worker if it has capacity_left and the
         # task has unclaimed members — prevents tiny tasks (e.g. 10 bots on
@@ -1001,6 +1037,10 @@ async def worker_claim_tasks(
                 # the queue instead of looping on the same one.
                 break
             take = min(remaining, capacity_left, fair_share_left)
+            # v8.4: in round_robin mode, also enforce per-cycle hard cap so
+            # multiple polls don't let one worker leapfrog its peers.
+            if rr_take_cap is not None:
+                take = min(take, rr_take_cap)
         log.debug(f"[CLAIM] w={w['name']} task={task['id'][:8]} online={online_count} eq_share={equal_share} my_already={my_already} cap_left={capacity_left} rem={remaining} age={task_age:.1f}s mopup={in_mopup} take={take}")
 
         if take <= 0:

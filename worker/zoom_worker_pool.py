@@ -74,8 +74,35 @@ OFFSCREEN_WINDOW = os.environ.get("OFFSCREEN_WINDOW", "true").lower() == "true"
 # Browser pooling: 1 chromium = TABS_PER_BROWSER contexts.
 # 20 is the sweet spot (RAM efficient + no shared-process crash).
 TABS_PER_BROWSER = int(os.environ.get("TABS_PER_BROWSER", "20"))
-BOT_REJOIN_MAX = int(os.environ.get("BOT_REJOIN_MAX", "2"))
+# v8.4: STRICT anti-leave. Bots will keep trying to rejoin THROUGHOUT the
+# meeting (not just first KICK_DETECT_WINDOW seconds). Old default 2 was way
+# too low for a 2-hour meeting where Zoom sometimes drops bots randomly.
+BOT_REJOIN_MAX = int(os.environ.get("BOT_REJOIN_MAX", "20"))
 KICK_DETECT_WINDOW = int(os.environ.get("KICK_DETECT_WINDOW", "180"))
+# v8.4: STRICT mode — ignore KICK_DETECT_WINDOW and allow rejoin for the
+# ENTIRE meeting hold_seconds. Default ON because user explicitly requested
+# "memeber forcfully join rhe end hone tk".
+STRICT_ANTI_LEAVE = os.environ.get("STRICT_ANTI_LEAVE", "true").lower() == "true"
+# Min/Max backoff (seconds) between rejoin attempts.
+REJOIN_BACKOFF_MIN = int(os.environ.get("REJOIN_BACKOFF_MIN", "3"))
+REJOIN_BACKOFF_MAX = int(os.environ.get("REJOIN_BACKOFF_MAX", "30"))
+
+# v8.4: ===== REACTIONS =====
+# When a task has participant_reactions=True OR floating_emoji=True, each bot
+# spawns a side-coroutine that periodically clicks the Zoom reaction button
+# and picks a random emoji. The interval (seconds) is read from the TASK
+# payload (`reaction_interval_min`/`reaction_interval_max`) — falls back here.
+REACTION_INTERVAL_MIN_DEFAULT = int(os.environ.get("REACTION_INTERVAL_MIN", "30"))
+REACTION_INTERVAL_MAX_DEFAULT = int(os.environ.get("REACTION_INTERVAL_MAX", "90"))
+REACTIONS_ENABLED = os.environ.get("REACTIONS_ENABLED", "true").lower() == "true"
+
+# v8.4: ===== KEEP TABS WARM ON CLEANUP =====
+# When ON (default), instead of closing the BrowserContext at the end of a
+# meeting we RECYCLE it — blank the page, return it to the prewarm ready pool.
+# Next task uses it instantly. Massive CPU saving since spinning up a new
+# context costs ~800ms-1.5s. User explicitly requested:
+#   "rdp clean mtlb procese bnd but jo tabs open hai vo nhi bnd honge"
+RECYCLE_CONTEXT_ON_END = os.environ.get("RECYCLE_CONTEXT_ON_END", "true").lower() == "true"
 
 # Auto health-thresholds. When CPU/RAM exceed these we throttle.
 CPU_THROTTLE_PCT = float(os.environ.get("CPU_THROTTLE_PCT", "75"))
@@ -221,7 +248,45 @@ ZOOM_SELECTORS = {
         "#join-confno", "input[name='confno']",
         "button.preview-join-button", "button#joinBtn",
     ],
+    # v8.4: ===== REACTIONS BUTTON / EMOJI PICKER =====
+    # Zoom Web Client renders a "Reactions" button in the meeting footer. Once
+    # clicked, an emoji picker appears with thumbs-up, heart, laugh, clap,
+    # surprise, etc. We try multiple selectors because Zoom releases (v2 vs
+    # v3 web SDK) render the DOM very differently.
+    "reactions_button": [
+        "button[aria-label*='reactions' i]",
+        "button[aria-label*='Reactions' i]",
+        "button.footer-button__button[aria-label*='reaction' i]",
+        "button[id*='reaction' i]",
+        ".footer-button-reactions",
+        # Some Zoom builds wrap it in a parent w/ data-testid:
+        "[data-testid*='reaction' i]",
+    ],
+    # Emoji buttons inside the popup. Order matches our REACTION_EMOJI_LABELS
+    # list for random picking. The aria-label varies by Zoom build, so we
+    # match by leading text.
+    "reaction_emoji_any": [
+        "button[aria-label='Clap']",
+        "button[aria-label='Thumbs up']",
+        "button[aria-label='Heart']",
+        "button[aria-label='Joy']",
+        "button[aria-label*='clap' i]",
+        "button[aria-label*='thumbs up' i]",
+        "button[aria-label*='heart' i]",
+        "button[aria-label*='laugh' i]",
+        "button[aria-label*='joy' i]",
+        "button[aria-label*='surprise' i]",
+        "button[aria-label*='party' i]",
+        "button[aria-label*='tada' i]",
+        ".emoji-item",            # generic class on older builds
+        ".reaction-emoji-item",
+    ],
 }
+
+# v8.4: emoji labels we'll cycle through for reactions. Random pick each tick.
+REACTION_EMOJI_LABELS = [
+    "Clap", "Thumbs up", "Heart", "Joy", "Surprise", "Party popper", "Tada",
+]
 
 
 async def _premute_on_preview(page) -> dict:

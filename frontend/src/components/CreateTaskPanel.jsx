@@ -26,6 +26,10 @@ export default function CreateTaskPanel({ onCreated, variant = "new" }) {
   const [timeout, setTimeoutSec] = useState(7200);
   const [floating, setFloating] = useState(false);
   const [reactions, setReactions] = useState(false);
+  // v8.4: reaction interval (seconds). Random pick in [min,max] between
+  // each emoji click. Only used when floating || reactions toggle is ON.
+  const [reactMinSec, setReactMinSec] = useState(30);
+  const [reactMaxSec, setReactMaxSec] = useState(90);
   const [schedEnabled, setSchedEnabled] = useState(false);
   const [schedAt, setSchedAt] = useState("");
   const [busy, setBusy] = useState(false);
@@ -63,6 +67,7 @@ export default function CreateTaskPanel({ onCreated, variant = "new" }) {
     setMembers("");
     setMeetingType(MEETING_TYPES[0]); setTimeoutSec(7200);
     setFloating(false); setReactions(false);
+    setReactMinSec(30); setReactMaxSec(90);
     setSchedEnabled(false); setSchedAt("");
   };
 
@@ -104,6 +109,11 @@ export default function CreateTaskPanel({ onCreated, variant = "new" }) {
         timeout: parseInt(timeout, 10) || 7200,
         floating_emoji: floating,
         participant_reactions: reactions,
+        reaction_interval_min: Math.max(5, parseInt(reactMinSec, 10) || 30),
+        reaction_interval_max: Math.max(
+          Math.max(5, parseInt(reactMinSec, 10) || 30),
+          parseInt(reactMaxSec, 10) || 90,
+        ),
         scheduled_at: schedEnabled && schedAt ? new Date(schedAt).toISOString() : null,
       };
       await api.post("/tasks", payload);
@@ -192,6 +202,42 @@ export default function CreateTaskPanel({ onCreated, variant = "new" }) {
           value={floating} onChange={setFloating} testid="task-floating-toggle" />
         <ToggleRow label={<><span aria-hidden>📢</span> Participant Reactions</>}
           value={reactions} onChange={setReactions} testid="task-reactions-toggle" />
+
+        {(floating || reactions) && (
+          <div className="zs-card p-3" data-testid="reaction-interval-block">
+            <div className="text-white/80 text-xs mb-2">
+              Reaction Interval — bot har <span className="text-emerald-400 font-semibold">{reactMinSec}s</span>
+              {" – "}
+              <span className="text-emerald-400 font-semibold">{reactMaxSec}s</span> me ek random emoji bhejega
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="zs-label">Min (seconds)</div>
+                <input
+                  className={cls}
+                  type="number"
+                  min="5"
+                  max="3600"
+                  value={reactMinSec}
+                  onChange={(e) => setReactMinSec(e.target.value)}
+                  data-testid="task-reaction-min-input"
+                />
+              </div>
+              <div>
+                <div className="zs-label">Max (seconds)</div>
+                <input
+                  className={cls}
+                  type="number"
+                  min="5"
+                  max="3600"
+                  value={reactMaxSec}
+                  onChange={(e) => setReactMaxSec(e.target.value)}
+                  data-testid="task-reaction-max-input"
+                />
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       <div className="mt-5">
