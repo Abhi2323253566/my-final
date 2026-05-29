@@ -1318,16 +1318,99 @@ async def _post_join_optimize(page: Page):
         pass
 
 
+async def _do_reaction_once(page: Page, name: str) -> bool:
+    """v8.4: Click the in-meeting Reactions button, then a random emoji.
+    Idempotent / best-effort — never raises. Returns True if an emoji landed.
+    """
+    import random as _r
+    try:
+        # Hover the meeting shell so the auto-hide footer appears
+        try:
+            shell = page.locator(".meeting-app, .meeting-client").first
+            if await shell.count() > 0:
+                box = await shell.bounding_box()
+                if box:
+                    await page.mouse.move(box["x"] + box["width"] / 2,
+                                          box["y"] + box["height"] - 20)
+        except Exception:
+            pass
+        # 1) Open the reactions popup
+        opened = await _smart_click(page, ZOOM_SELECTORS["reactions_button"],
+                                    timeout_ms=2500)
+        if not opened:
+            return False
+        await page.wait_for_timeout(250)
+        # 2) Pick a random emoji selector and click it
+        emoji_sels = ZOOM_SELECTORS["reaction_emoji_any"][:]
+        _r.shuffle(emoji_sels)
+        for sel in emoji_sels:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click(timeout=1500)
+                    return True
+            except Exception:
+                continue
+        # Close popup if nothing clicked (Esc to dismiss)
+        try: await page.keyboard.press("Escape")
+        except Exception: pass
+        return False
+    except Exception:
+        return False
+
+
+async def _reaction_loop(page: Page, slot: BotSlot,
+                         interval_min: int, interval_max: int):
+    """Side-coroutine spawned per-bot when participant_reactions / floating_emoji
+    is enabled. Sleeps a random interval then fires one reaction. Cancellable —
+    main loop calls .cancel() on cleanup."""
+    import random as _r
+    # Stagger initial fire so 50 bots don't all click together
+    try:
+        await asyncio.sleep(_r.uniform(2, max(interval_min, 5)))
+    except asyncio.CancelledError:
+        return
+    while not slot.closed:
+        try:
+            if slot.joined:
+                await _do_reaction_once(page, slot.name)
+            wait = _r.uniform(max(5, interval_min), max(interval_min + 1, interval_max))
+            await asyncio.sleep(wait)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            await asyncio.sleep(5)
+
+
 async def run_bot(slot: BotSlot, browser_slot: BrowserSlot, meeting_id: str,
                   password: str, hold_seconds: int,
-                  pool: Optional["BrowserPool"] = None) -> bool:
+                  pool: Optional["BrowserPool"] = None,
+                  task_cfg: Optional[dict] = None) -> bool:
     """One bot lifecycle inside a shared browser:
-       newContext → newPage → join → hold → cleanup.
+       newContext → newPage → join → hold (with reactions + anti-leave) → cleanup.
     Returns True if it ever joined.
 
     Optimization: if `pool` is provided AND has a ready prewarmed context,
     we use it INSTEAD of creating a fresh one (instant handoff).
+
+    v8.4 features:
+      • Reactions side-coroutine driven by task_cfg flags + intervals.
+      • STRICT anti-leave — keep rejoining for ENTIRE hold_seconds (no early
+        kick-window cutoff). Random backoff between attempts.
+      • RECYCLE_CONTEXT_ON_END — instead of closing the context at meeting end,
+        we blank the page and hand it back to the prewarm ready pool so the
+        next task picks up an already-warmed tab (massive CPU/time saver).
     """
+    task_cfg = task_cfg or {}
+    reactions_on = REACTIONS_ENABLED and bool(
+        task_cfg.get("participant_reactions") or task_cfg.get("floating_emoji")
+    )
+    r_min = int(task_cfg.get("reaction_interval_min") or REACTION_INTERVAL_MIN_DEFAULT)
+    r_max = int(task_cfg.get("reaction_interval_max") or REACTION_INTERVAL_MAX_DEFAULT)
+    if r_max < r_min:
+        r_max = r_min + 10
+    reaction_task: Optional[asyncio.Task] = None
+    recycled_to_pool = False
     try:
         ctx = None
         page = None
