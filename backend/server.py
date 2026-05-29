@@ -1953,8 +1953,10 @@ async def download_names_in_txt():
 
 # ---------------- Lifecycle ----------------
 async def seed_admin():
-    email = os.environ["ADMIN_EMAIL"].lower().strip()
-    password = os.environ["ADMIN_PASSWORD"]
+    # Hard fallback defaults so live deploys without env vars still seed a
+    # working admin user. Local .env still overrides via os.environ.
+    email = os.environ.get("ADMIN_EMAIL", "admin@finalzoom.com").lower().strip()
+    password = os.environ.get("ADMIN_PASSWORD", "Admin@FinalZoom2026")
     name = os.environ.get("ADMIN_NAME", "Admin")
     usage_limit = int(os.environ.get("USAGE_LIMIT", 15000))
     existing = await db.users.find_one({"email": email})

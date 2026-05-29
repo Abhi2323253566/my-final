@@ -389,10 +389,19 @@ MEDIA_KILL_INIT_SCRIPT = r"""
       };
     }
 
-    // Override enumerateDevices → return ZERO devices so Zoom UI greys controls out
+    // v8.6: Return FAKE devices so Zoom shows mic + camera icons on bot tile
+    // (user wants the icons VISIBLE but in OFF state — looks like a real
+    // participant who just muted themselves). Real bytes still never leave
+    // because getUserMedia returns silent/blank streams above.
     const origEnum = md.enumerateDevices ? md.enumerateDevices.bind(md) : null;
     md.enumerateDevices = function() {
-      return Promise.resolve([]);
+      return Promise.resolve([
+        { deviceId: 'default',           kind: 'audioinput',  label: 'Default - Microphone (Built-in)', groupId: 'grp-mic-1', toJSON(){return this;} },
+        { deviceId: 'mic-builtin-1',     kind: 'audioinput',  label: 'Microphone (Built-in)',           groupId: 'grp-mic-1', toJSON(){return this;} },
+        { deviceId: 'default',           kind: 'audiooutput', label: 'Default - Speaker (Built-in)',    groupId: 'grp-spk-1', toJSON(){return this;} },
+        { deviceId: 'spk-builtin-1',     kind: 'audiooutput', label: 'Speaker (Built-in)',              groupId: 'grp-spk-1', toJSON(){return this;} },
+        { deviceId: 'cam-builtin-1',     kind: 'videoinput',  label: 'HD Webcam (Built-in)',            groupId: 'grp-cam-1', toJSON(){return this;} },
+      ]);
     };
 
     // Block any RTCPeerConnection from adding real tracks via addTrack
@@ -637,14 +646,14 @@ CHROMIUM_ARGS = [
     "--mute-audio",
     "--autoplay-policy=no-user-gesture-required",
     "--use-fake-ui-for-media-stream",
-    # v8.3.5 GREEN-SCREEN FIX:
-    # `--use-fake-device-for-media-stream` (removed) made Chrome generate a
-    # green/yellow test-pattern video stream the moment Zoom called
-    # getUserMedia({video:true}). Even with JOIN_WITH_VIDEO_OFF the bot
-    # broadcast 1-2 frames of that green pattern before our "stop video"
-    # click landed. Removing this flag means there is NO video source at
-    # all — combined with `permissions=["microphone"]` below, Zoom's video
-    # request is denied and no green frames can ever leak out.
+    "--use-fake-device-for-media-stream",
+    # v8.3.6 USER-REQUESTED STEALTH:
+    # User explicitly wants BOTH fake-ui AND fake-device flags so the bot
+    # advertises mic + camera devices to Zoom (icons must be visible on the
+    # participant tile). Audio/Video are still kept strictly OFF via
+    # JOIN_WITH_VIDEO_OFF, post-join Alt+A / Alt+V keyboard mute, and
+    # navigator.mediaDevices.enumerateDevices mock — so no green frames or
+    # audio leak even though Chrome generates a synthetic test pattern.
     "--no-first-run",
     "--no-default-browser-check",
     "--metrics-recording-only",
@@ -1351,13 +1360,19 @@ async def _join_meeting(page: Page, meeting_id: str, password: str, name: str) -
         return await _is_in_meeting(page)  # fall through to legacy verify
 
     # ===== Dismiss any "Join Audio by Computer" prompt (best-effort, fast) =====
-    try:
-        audio_btn = await _wait_any(page, ZOOM_SELECTORS["audio_join"], timeout_ms=1500)
-        if audio_btn is not None:
-            try: await audio_btn.click(timeout=1500)
+    # v8.6: Extended timeout + retry — clicking this is what makes the mic icon
+    # appear on the bot tile. If we skip it, Zoom shows a "join audio" phone
+    # icon instead of the muted mic icon (user wants mic icon visible).
+    for _ in range(3):
+        try:
+            audio_btn = await _wait_any(page, ZOOM_SELECTORS["audio_join"], timeout_ms=2500)
+            if audio_btn is None:
+                break
+            try: await audio_btn.click(timeout=2000, force=True)
             except Exception: pass
-    except Exception:
-        pass
+            await page.wait_for_timeout(400)
+        except Exception:
+            break
 
     return await _is_in_meeting(page)
 
@@ -1391,33 +1406,72 @@ async def _post_join_optimize(page: Page):
        - hide all <video>/<canvas> via CSS so GPU isn't decoding remote streams
        - flip document.visibilityState='hidden' so Chrome throttles renderer ~10×
     """
-    # Belt-and-suspenders MIC MUTE — if pre-mute on preview failed, mute now
+    # v8.6: Belt-and-suspenders MIC MUTE — multi-strategy retry with verification.
+    # Strategies tried in order until mic shows "unmute" (= currently muted) state:
+    #   1. Click button[aria-label*='mute my microphone']  → standard
+    #   2. Press keyboard shortcut Alt+A                    → Zoom WC global toggle
+    #   3. Locate by .footer-button__button label "Mute"   → legacy fallback
     if JOIN_WITH_AUDIO_MUTED:
-        for _ in range(2):  # retry once
+        for attempt in range(5):
             try:
-                # Look for "unmute" label first → means currently MUTED, skip
-                unmute_state = page.locator("button[aria-label*='unmute my microphone' i]").first
+                # ✓ Already muted? aria says "Unmute my microphone"
+                unmute_state = page.locator("button[aria-label*='unmute' i][aria-label*='microphone' i]").first
                 if await unmute_state.count() > 0:
-                    break  # already muted ✓
-                mic = page.locator("button[aria-label*='mute my microphone' i]").first
-                if await mic.count() > 0:
-                    await mic.click(timeout=2000)
-                    await page.wait_for_timeout(200)
+                    break
+                # Strategy 1: direct mute-button click
+                clicked = False
+                for sel in [
+                    "button[aria-label*='mute my microphone' i]",
+                    "button[aria-label='Mute']",
+                    ".footer-button__button[aria-label*='mute' i]",
+                ]:
+                    try:
+                        mic = page.locator(sel).first
+                        if await mic.count() > 0:
+                            await mic.click(timeout=1500, force=True)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                # Strategy 2: keyboard shortcut Alt+A (Zoom Web Client global)
+                if not clicked:
+                    try:
+                        await page.keyboard.press("Alt+a")
+                    except Exception:
+                        pass
+                await page.wait_for_timeout(400)
             except Exception:
                 pass
 
-    # Belt-and-suspenders STOP VIDEO
+    # v8.6: Belt-and-suspenders STOP VIDEO — same multi-strategy pattern.
+    # Alt+V is Zoom Web Client's global video toggle shortcut.
     if JOIN_WITH_VIDEO_OFF:
-        for _ in range(2):
+        for attempt in range(5):
             try:
-                # If "Start Video" is present → means already off, skip
+                # ✓ Already off? aria says "Start Video"
                 start_state = page.locator("button[aria-label*='start video' i]").first
                 if await start_state.count() > 0:
-                    break  # already off ✓
-                vid = page.locator("button[aria-label*='stop my video' i]").first
-                if await vid.count() > 0:
-                    await vid.click(timeout=2000)
-                    await page.wait_for_timeout(200)
+                    break
+                clicked = False
+                for sel in [
+                    "button[aria-label*='stop my video' i]",
+                    "button[aria-label='Stop Video']",
+                    ".footer-button__button[aria-label*='stop video' i]",
+                ]:
+                    try:
+                        vid = page.locator(sel).first
+                        if await vid.count() > 0:
+                            await vid.click(timeout=1500, force=True)
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    try:
+                        await page.keyboard.press("Alt+v")
+                    except Exception:
+                        pass
+                await page.wait_for_timeout(400)
             except Exception:
                 pass
     # Kill remote video render + throttle
