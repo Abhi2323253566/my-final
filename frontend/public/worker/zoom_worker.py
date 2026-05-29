@@ -436,6 +436,7 @@ def _build_chrome_opts(headless: bool, chrome_bin: str, profile_dir: str) -> Chr
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
     opts.add_argument("--mute-audio")  # chrome-level audio mute (output)
     # ---- STRICT MUTE / CAMERA OFF FLAGS ----
     # Force fake silent audio + black video device at the *driver* level — even
@@ -445,8 +446,29 @@ def _build_chrome_opts(headless: bool, chrome_bin: str, profile_dir: str) -> Chr
     # Tell Chrome to register fake-mic + fake-cam permissions automatically.
     opts.add_argument("--enable-usermedia-screen-capturing")
     opts.add_argument("--allow-running-insecure-content")
-    # Disable any auto audio capture from system/loopback
-    opts.add_argument("--disable-features=AudioServiceOutOfProcess,WebRtcHideLocalIpsWithMdns")
+    # Disable any auto audio capture from system/loopback + heavy features.
+    # We bundle every disabled feature into a single flag (Chrome only honours
+    # the last --disable-features= argument).
+    opts.add_argument(
+        "--disable-features=" + ",".join([
+            "AudioServiceOutOfProcess",       # keep audio in-process (lighter)
+            "WebRtcHideLocalIpsWithMdns",
+            "Translate",                       # no translate popups
+            "OptimizationHints",
+            "MediaRouter",                     # cast/discovery off
+            "DialMediaRouteProvider",
+            "AcceptCHFrame",
+            "AutofillServerCommunication",
+            "CertificateTransparencyComponentUpdater",
+            "InterestFeedContentSuggestions",
+            "CalculateNativeWinOcclusion",     # save CPU on Windows
+            "GlobalMediaControls",
+            "ImprovedCookieControls",
+            "LazyFrameLoading",
+            "PrivacySandboxSettings4",
+            "site-per-process",                # less process sprawl
+        ])
+    )
     opts.add_argument("--disable-webrtc-hw-encoding")
     opts.add_argument("--disable-webrtc-hw-decoding")
     opts.add_argument("--window-size=1280,720")
@@ -458,6 +480,36 @@ def _build_chrome_opts(headless: bool, chrome_bin: str, profile_dir: str) -> Chr
     opts.add_argument("--no-first-run")
     opts.add_argument("--disable-sync")
     opts.add_argument("--disable-translate")
+    # ---- ULTRA-OPTIMIZATION FLAGS (memory/CPU/process stability) ----
+    # Stop Chrome from throttling JS timers when window is backgrounded /
+    # occluded — Zoom's heartbeats MUST keep firing or the bot drops.
+    opts.add_argument("--disable-background-timer-throttling")
+    opts.add_argument("--disable-backgrounding-occluded-windows")
+    opts.add_argument("--disable-renderer-backgrounding")
+    # CalculateNativeWinOcclusion is already in the consolidated --disable-features list above.
+    # Don't pause/kill renderers on low memory — we'd rather swap than crash.
+    opts.add_argument("--memory-pressure-off")
+    opts.add_argument("--disable-low-end-device-mode")
+    # Strip every non-essential subsystem that eats RAM/CPU.
+    opts.add_argument("--disable-hang-monitor")               # don't kill "unresponsive" Zoom tab
+    opts.add_argument("--disable-prompt-on-repost")
+    opts.add_argument("--disable-client-side-phishing-detection")
+    opts.add_argument("--disable-component-update")
+    opts.add_argument("--disable-domain-reliability")
+    opts.add_argument("--disable-breakpad")                   # no crash reporter
+    opts.add_argument("--disable-crash-reporter")
+    opts.add_argument("--disable-ipc-flooding-protection")    # large WS bursts ok
+    opts.add_argument("--disable-popup-blocking")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--no-default-browser-check")
+    opts.add_argument("--no-pings")
+    opts.add_argument("--metrics-recording-only")
+    opts.add_argument("--password-store=basic")
+    opts.add_argument("--use-mock-keychain")
+    opts.add_argument("--force-color-profile=srgb")
+    # site-per-process is already disabled via the consolidated --disable-features list above.
+    opts.add_argument("--renderer-process-limit=1")           # 1 renderer per Chrome
+    opts.add_argument("--js-flags=--max-old-space-size=256")  # cap V8 heap @ 256MB
     opts.add_argument("--log-level=3")
     opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
@@ -711,6 +763,27 @@ def bot_process(meeting_id: str, password: str, name: str, hold_seconds: int,
 
 # ---------------- Task runner ----------------
 def run_task(task: dict):
+    """Outer wrapper: catches any unexpected exception in the inner runner so
+    a single bad task never silently kills the dispatcher thread without
+    reporting completion + freeing the RUNNING slot."""
+    task_id = task.get("id", "unknown")
+    try:
+        _run_task_inner(task)
+    except Exception as e:
+        try: log(f"run_task FATAL for {task_id[:8]}: {type(e).__name__}: {str(e)[:180]}")
+        except Exception: pass
+        try: traceback.print_exc()
+        except Exception: pass
+        # Always free the slot + tell the dashboard so the task can be
+        # re-claimed by another worker.
+        try:
+            with RUNNING_LOCK: RUNNING.pop(task_id, None)
+        except Exception: pass
+        try: complete_task(task_id, success=False, joined=0, error=f"worker crash: {type(e).__name__}")
+        except Exception: pass
+
+
+def _run_task_inner(task: dict):
     task_id = task["id"]
     meeting_id = task["meeting_id"]
     password = task.get("meeting_password") or ""
@@ -956,19 +1029,24 @@ def main_loop():
 
     last_idle = time.time()
     while not STOP.is_set():
-        # Compute load = sum of alive bots across all running tasks
-        with RUNNING_LOCK:
-            load = sum(sum(1 for p in t["processes"] if p.is_alive())
-                       for t in RUNNING.values())
-        heartbeat(load_override=load)
+        try:
+            # Compute load = sum of alive bots across all running tasks
+            with RUNNING_LOCK:
+                load = sum(sum(1 for p in t["processes"] if p.is_alive())
+                           for t in RUNNING.values())
+            heartbeat(load_override=load)
 
-        if len(RUNNING) < MAX_CONCURRENT_TASKS:
-            tasks = claim_tasks(n=min(5, MAX_CONCURRENT_TASKS - len(RUNNING)))
-            for t in tasks:
-                threading.Thread(target=run_task, args=(t,), daemon=True).start()
+            if len(RUNNING) < MAX_CONCURRENT_TASKS:
+                tasks = claim_tasks(n=min(5, MAX_CONCURRENT_TASKS - len(RUNNING)))
+                for t in tasks:
+                    threading.Thread(target=run_task, args=(t,), daemon=True).start()
 
-        if not RUNNING and (time.time() - last_idle) > 300:
-            kill_orphans(); gc.collect(); last_idle = time.time()
+            if not RUNNING and (time.time() - last_idle) > 300:
+                kill_orphans(); gc.collect(); last_idle = time.time()
+        except Exception as e:
+            # Never let a transient error break the poll loop — log + retry
+            try: log(f"main-loop tick error: {type(e).__name__}: {str(e)[:140]}")
+            except Exception: pass
 
         STOP.wait(POLL_INTERVAL)
 
@@ -987,13 +1065,71 @@ def main_loop():
 def _sig(_a, _b): STOP.set()
 
 
+# ---------------- Keep-alive supervisor ----------------
+# Wraps main_loop() so any unexpected crash (Selenium glitch, network blip,
+# random library exception) is caught and the worker is restarted instead of
+# the whole script dying. Exponential-ish backoff (5s → 30s) so we don't busy-
+# loop if something is fundamentally broken (e.g. dashboard URL wrong) but
+# still recover quickly from transient issues.
+#
+# This is the "forcefully keep RDP alive" mechanism the user asked for: as
+# long as this Python process is alive, it will keep trying to do work. To
+# stop it, the operator presses Ctrl-C (SIGINT) — STOP.is_set() then breaks
+# the supervisor too.
+KEEPALIVE_BACKOFF_MIN = int(os.environ.get("KEEPALIVE_BACKOFF_MIN", "5"))
+KEEPALIVE_BACKOFF_MAX = int(os.environ.get("KEEPALIVE_BACKOFF_MAX", "30"))
+
+
+def _supervised_main():
+    """Forever-restart wrapper around main_loop. Only exits on STOP signal."""
+    backoff = KEEPALIVE_BACKOFF_MIN
+    crash_count = 0
+    while not STOP.is_set():
+        try:
+            main_loop()
+            # main_loop returned normally (only happens on STOP) → exit
+            if STOP.is_set():
+                break
+            # Defensive: if main_loop ever returns without STOP, restart anyway
+            log("WARN: main_loop returned without STOP — restarting in 5s")
+            time.sleep(5)
+            continue
+        except KeyboardInterrupt:
+            STOP.set()
+            break
+        except SystemExit as e:
+            # main_loop deliberately sys.exit'd (e.g. pre-flight failure).
+            # On the very first attempt, propagate so the operator sees it.
+            # On subsequent attempts, treat as a crash and keep retrying with
+            # backoff — Chrome may have recovered.
+            if crash_count == 0:
+                raise
+            log(f"main_loop SystemExit({e.code}) — restarting in {backoff}s")
+        except Exception:
+            log("FATAL in main_loop — full traceback:")
+            try: traceback.print_exc()
+            except Exception: pass
+        crash_count += 1
+        # Try to clean up any orphan chromes before restart
+        try: kill_orphans()
+        except Exception: pass
+        log(f"keep-alive: main_loop crashed (#{crash_count}) — sleeping {backoff}s then restarting")
+        # Sleep in 1s chunks so SIGINT is responsive
+        for _ in range(backoff):
+            if STOP.is_set(): break
+            time.sleep(1)
+        # Exponential-ish backoff capped at KEEPALIVE_BACKOFF_MAX
+        backoff = min(KEEPALIVE_BACKOFF_MAX, max(KEEPALIVE_BACKOFF_MIN, backoff * 2))
+    log("keep-alive: STOP signalled — exiting cleanly")
+
+
 if __name__ == "__main__":
     # Windows multiprocessing safety
     mp.freeze_support()
     signal.signal(signal.SIGINT, _sig)
     if hasattr(signal, "SIGTERM"): signal.signal(signal.SIGTERM, _sig)
     try:
-        main_loop()
+        _supervised_main()
     except KeyboardInterrupt:
         STOP.set()
     except Exception:

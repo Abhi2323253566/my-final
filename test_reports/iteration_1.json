@@ -1,0 +1,42 @@
+{
+  "summary": "E2E backend smoke test for FinalZoom orchestration — 9/9 tests passing. Covers admin auth, worker register+heartbeat, task CRUD, fair work distribution regression (30 + 40 workers vs 500 members), task lifecycle (claim → progress → complete), and cancellation. Distribution regression confirmed: no worker hoards the entire task and ≥90% of workers receive a non-zero share, well within the +/-2 vs equal_share envelope expected after the prior bug fix.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/workers/me/claim", "issue": "When the heartbeat-driven 'online_count' includes stale workers from previous test runs (no auto-purge of offline workers), per-task fair_share can shrink to a smaller-than-expected value. Not a correctness bug — atomic members_claimed cap prevents overshoot — but it can make a single run claim less per worker than the literal num_workers in the active test suite. Consider periodically marking workers offline whose last_heartbeat is older than HEALTH_STALE_SECONDS so online_count more accurately reflects current capacity."},
+      {"endpoint": "POST /api/workers/me/progress", "issue": "Review request lists this path but the actual implementation is PATCH /api/tasks/{task_id}/progress (worker token). Similarly 'POST /api/workers/me/complete' is POST /api/tasks/{task_id}/complete. Either align the API to the documented design, or update the spec/playbook to match the real routes."},
+      {"endpoint": "Task status model", "issue": "Spec mentions 'claimed/running' state but the model only has scheduled | active | completed | failed | cancelled. Transition observed: scheduled→active→completed (no separate 'claimed' state). Worth documenting in the API contract."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_e2e_smoke.py",
+    "/app/test_reports/pytest/e2e_smoke.xml"
+  ],
+  "action_items": [
+    "(Low) Auto-mark workers offline after HEALTH_STALE_SECONDS so the claim endpoint's online_count is accurate without manual cleanup.",
+    "(Doc) Update worker-side spec: progress is PATCH /api/tasks/{id}/progress and complete is POST /api/tasks/{id}/complete — not /api/workers/me/{progress|complete}.",
+    "(Doc) Clarify task status enum — 'claimed/running' from the spec maps to backend 'active'."
+  ],
+  "critical_code_review_comments": [
+    "/app/backend/server.py is 2049 lines — exceeds the 700-line guideline. Splitting into modules (auth, tasks, workers, claim, admin, name-files, topup) would significantly improve maintainability and unit-test surface.",
+    "worker_claim_tasks is correctly atomic (unconditional $inc + overshoot rollback) — strong against the previous starvation bug. Comment + log line are clear. Good fix.",
+    "MOPUP path uses fair_share*2 as a soft cap — reasonable. last_claim_at is properly maintained on every successful claim.",
+    "Cookie-based admin auth + Bearer worker token co-exist cleanly via separate dependencies; recommend documenting which routes accept which auth in the OpenAPI tags.",
+    "Endpoint naming inconsistency: progress/complete are nested under /tasks but conceptually they are worker actions. Worth standardising under /workers/me/* (matches review_request expectation) to make the worker API one cohesive surface."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_e2e_smoke.py"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "not tested (per request)"},
+  "test_credentials": "admin@finalzoom.com / Admin@FinalZoom2026 (from /app/backend/.env; matches /app/memory/test_credentials.md). Cookie-based session — no JWT in response body (just user object).",
+  "seed_data_creation": "Test creates ephemeral workers prefixed 'e2e-<hex6>-' and small tasks (5–500 members). All cleaned up in fixture teardown (cancel active tasks + delete e2e workers). Verified DB has 0 active/scheduled tasks and 0 e2e workers after run.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Run: `cd /app && pytest backend/tests/test_e2e_smoke.py -v --tb=short --junitxml=/app/test_reports/pytest/e2e_smoke.xml`. Takes ~105s end-to-end. The fair-distribution test parametrizes both 30 and 40 worker counts. NOTE: review_request claims worker progress/complete are under /api/workers/me/* — they are actually PATCH /api/tasks/{id}/progress and POST /api/tasks/{id}/complete (worker Bearer token). Backend session login is cookie-based (no token in response). The 30 leftover workers in DB are real user-owned workers from previous fork sessions — do not delete.",
+  "rca of the issue": "Not a bug RCA — this is a fresh E2E validation. Previous fork's claim-endpoint fix (atomic $inc with overshoot rollback + tighter MOPUP_STALL_SECS) is confirmed working: at 30 workers × 500 members, max claim per worker stayed at ~equal_share (17) with no starvation; at 40 workers × 500 members, ≥90% non-zero distribution (the last 1-2 workers may get zero due to ceil(500/40)*40 > 500, which is mathematically expected). Starvation regression is closed."
+}
