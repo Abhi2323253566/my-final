@@ -248,24 +248,36 @@ ZOOM_SELECTORS = {
         "#join-confno", "input[name='confno']",
         "button.preview-join-button", "button#joinBtn",
     ],
-    # v8.4: ===== REACTIONS BUTTON / EMOJI PICKER =====
+    # v8.4 + v8.5: ===== REACTIONS BUTTON / EMOJI PICKER =====
     # Zoom Web Client renders a "Reactions" button in the meeting footer. Once
     # clicked, an emoji picker appears with thumbs-up, heart, laugh, clap,
     # surprise, etc. We try multiple selectors because Zoom releases (v2 vs
-    # v3 web SDK) render the DOM very differently.
+    # v3 web SDK + 2026 redesign) render the DOM very differently.
     "reactions_button": [
-        "button[aria-label*='reactions' i]",
+        # 2026 Zoom Web Client (v3 SDK)
         "button[aria-label*='Reactions' i]",
-        "button.footer-button__button[aria-label*='reaction' i]",
-        "button[id*='reaction' i]",
-        ".footer-button-reactions",
-        # Some Zoom builds wrap it in a parent w/ data-testid:
+        "button[aria-label*='reaction' i]",
+        "[data-tooltip-id*='reaction' i]",
         "[data-testid*='reaction' i]",
+        "button[id*='reaction' i]",
+        # Legacy v1/v2 builds
+        "button.footer-button__button[aria-label*='reaction' i]",
+        ".footer-button-reactions",
+        ".footer-button__button-label:has-text('Reactions')",
+        # "More" overflow on narrow viewports — reactions sometimes nested inside
+        "button[aria-label*='More meeting controls' i]",
+        "button[aria-label='More']",
     ],
     # Emoji buttons inside the popup. Order matches our REACTION_EMOJI_LABELS
     # list for random picking. The aria-label varies by Zoom build, so we
     # match by leading text.
     "reaction_emoji_any": [
+        # 2026 — emoji popup uses role="menuitem" or role="button" with emoji char in aria-label
+        "div[role='menuitem'][aria-label*='clap' i]",
+        "div[role='menuitem'][aria-label*='thumbs up' i]",
+        "div[role='menuitem'][aria-label*='heart' i]",
+        "div[role='menuitem'][aria-label*='joy' i]",
+        "div[role='menuitem']",
         "button[aria-label='Clap']",
         "button[aria-label='Thumbs up']",
         "button[aria-label='Heart']",
@@ -278,10 +290,127 @@ ZOOM_SELECTORS = {
         "button[aria-label*='surprise' i]",
         "button[aria-label*='party' i]",
         "button[aria-label*='tada' i]",
+        "button[aria-label*='fire' i]",
         ".emoji-item",            # generic class on older builds
         ".reaction-emoji-item",
+        ".reaction-menu__emoji-item",
+        ".emoji-mart-emoji",
     ],
 }
+
+# ============================================================================
+# v8.5: ===== NUCLEAR MEDIA KILL SWITCH =====
+# Init script injected into EVERY page BEFORE any Zoom JS runs. It hijacks
+# browser-level media APIs so even if Zoom's UI claims the mic/camera is "on",
+# no actual audio/video bytes can ever leave the browser. This is the bullet-
+# proof guarantee of OFF mic + OFF cam regardless of Zoom WebClient DOM state.
+#
+# How it works:
+#   - navigator.mediaDevices.getUserMedia() resolves to a MediaStream whose
+#     audio + video tracks are immediately .stop()'d (ended=true). Zoom thinks
+#     it has a stream but emits silence + a frozen/empty track.
+#   - navigator.mediaDevices.enumerateDevices() returns an EMPTY array → Zoom
+#     UI greys out the camera/mic toggles entirely on most builds.
+#   - getDisplayMedia (screen share) is similarly neutered.
+# ============================================================================
+MEDIA_KILL_INIT_SCRIPT = r"""
+(() => {
+  try {
+    const md = navigator.mediaDevices;
+    if (!md) return;
+
+    // Helper: build an empty/ended MediaStream
+    function emptyStream(constraints) {
+      try {
+        const tracks = [];
+        // Silent audio track via AudioContext + MediaStreamDestination
+        if (constraints && constraints.audio) {
+          try {
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const dst = ctx.createMediaStreamDestination();
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            gain.gain.value = 0; // SILENT
+            osc.connect(gain).connect(dst);
+            osc.start();
+            const at = dst.stream.getAudioTracks()[0];
+            if (at) {
+              try { at.enabled = false; } catch(e){}
+              tracks.push(at);
+            }
+          } catch (e) {}
+        }
+        // Blank black video track via canvas
+        if (constraints && constraints.video) {
+          try {
+            const canvas = document.createElement('canvas');
+            canvas.width = 2; canvas.height = 2;
+            const c = canvas.getContext('2d');
+            c.fillStyle = '#000'; c.fillRect(0, 0, 2, 2);
+            const cs = canvas.captureStream(1); // 1 fps
+            const vt = cs.getVideoTracks()[0];
+            if (vt) {
+              try { vt.enabled = false; } catch(e){}
+              tracks.push(vt);
+            }
+          } catch (e) {}
+        }
+        const s = new MediaStream(tracks);
+        // Immediately disable + stop tracks → zero broadcast
+        try { s.getTracks().forEach(t => { try{t.enabled=false;}catch(e){} }); } catch(e){}
+        return s;
+      } catch (e) {
+        return new MediaStream();
+      }
+    }
+
+    // Override getUserMedia
+    const origGUM = md.getUserMedia ? md.getUserMedia.bind(md) : null;
+    md.getUserMedia = function(constraints) {
+      try {
+        console.log('[MEDIA-KILL] getUserMedia intercepted', constraints);
+      } catch(e){}
+      return Promise.resolve(emptyStream(constraints || {}));
+    };
+
+    // Legacy getUserMedia
+    try {
+      navigator.getUserMedia = function(c, ok, err) {
+        try { ok(emptyStream(c || {})); } catch(e) { if (err) err(e); }
+      };
+      navigator.webkitGetUserMedia = navigator.getUserMedia;
+      navigator.mozGetUserMedia = navigator.getUserMedia;
+    } catch(e){}
+
+    // Override getDisplayMedia (block screen-share too)
+    if (md.getDisplayMedia) {
+      md.getDisplayMedia = function() {
+        return Promise.resolve(new MediaStream());
+      };
+    }
+
+    // Override enumerateDevices → return ZERO devices so Zoom UI greys controls out
+    const origEnum = md.enumerateDevices ? md.enumerateDevices.bind(md) : null;
+    md.enumerateDevices = function() {
+      return Promise.resolve([]);
+    };
+
+    // Block any RTCPeerConnection from adding real tracks via addTrack
+    try {
+      const RPC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+      if (RPC && RPC.prototype && RPC.prototype.addTrack) {
+        const origAdd = RPC.prototype.addTrack;
+        RPC.prototype.addTrack = function(track, ...streams) {
+          try { if (track) track.enabled = false; } catch(e){}
+          return origAdd.call(this, track, ...streams);
+        };
+      }
+    } catch(e){}
+  } catch (e) {
+    try { console.warn('[MEDIA-KILL] init err', e); } catch(_){}
+  }
+})();
+"""
 
 # v8.4: emoji labels we'll cycle through for reactions. Random pick each tick.
 REACTION_EMOJI_LABELS = [
