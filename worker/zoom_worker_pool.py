@@ -443,7 +443,14 @@ CHROMIUM_ARGS = [
     "--mute-audio",
     "--autoplay-policy=no-user-gesture-required",
     "--use-fake-ui-for-media-stream",
-    "--use-fake-device-for-media-stream",
+    # v8.3.5 GREEN-SCREEN FIX:
+    # `--use-fake-device-for-media-stream` (removed) made Chrome generate a
+    # green/yellow test-pattern video stream the moment Zoom called
+    # getUserMedia({video:true}). Even with JOIN_WITH_VIDEO_OFF the bot
+    # broadcast 1-2 frames of that green pattern before our "stop video"
+    # click landed. Removing this flag means there is NO video source at
+    # all — combined with `permissions=["microphone"]` below, Zoom's video
+    # request is denied and no green frames can ever leak out.
     "--no-first-run",
     "--no-default-browser-check",
     "--metrics-recording-only",
@@ -601,7 +608,10 @@ async def bootstrap_storage_state(pw) -> bool:
             viewport={"width": 800, "height": 600},
             ignore_https_errors=True,
             bypass_csp=True,
-            permissions=["microphone", "camera"],
+            # v8.3.5: MIC ONLY. No camera permission → Zoom's video
+            # getUserMedia call is rejected by the browser, so the bot
+            # CANNOT broadcast video (no green screen ever).
+            permissions=["microphone"],
             locale="en-US",
         )
         page = await ctx.new_page()
@@ -689,7 +699,12 @@ def _new_context_kwargs() -> dict:
         viewport={"width": 800, "height": 600},
         ignore_https_errors=True,
         bypass_csp=True,
-        permissions=["microphone", "camera"],
+        # v8.3.5: MIC ONLY (no camera) — see CHROMIUM_ARGS note. With
+        # --use-fake-device-for-media-stream removed AND camera permission
+        # not granted, Zoom's getUserMedia({video:true}) is rejected →
+        # bot physically cannot transmit a video stream, so the host can
+        # never see a green/black test-pattern frame.
+        permissions=["microphone"],
         locale="en-US",
     )
     if os.path.exists(STORAGE_STATE_PATH):
@@ -957,7 +972,7 @@ class BrowserPool:
             "alive": sum(1 for b in self.browsers if b.alive),
             "ready_contexts": len(self.ready),
             "prewarmed": self._prewarmed,
-            "version": "v8.3.4-headless-muted",
+            "version": "v8.3.5-no-green-screen",
             "storage_state_age_hours": ss_age_h,
             "persistent_cache": PERSISTENT_CACHE,
             "preload_url": PREWARM_PRELOAD_URL,
@@ -980,7 +995,7 @@ def heartbeat(load_override: int, capacity_override: Optional[int] = None,
         "cpu_pct": s["cpu_pct"],
         "ram_pct": s["ram_pct"],
         "hostname": socket.gethostname(),
-        "os_info": f"{platform.system()} {platform.release()} (Playwright v8.3.4-headless-muted)",
+        "os_info": f"{platform.system()} {platform.release()} (Playwright v8.3.5-no-green-screen)",
         "cpu_count": s["cpu_count"],
         "ram_free_gb": round(s["free_ram_gb"], 2),
     }
@@ -1559,7 +1574,7 @@ async def main():
                 pass
 
     s = _machine_specs()
-    log.info(f"Zoom Worker v8.3.4 (headless + muted-join + offscreen) starting")
+    log.info(f"Zoom Worker v8.3.5 (headless + muted-join + offscreen + no-camera-perm) starting")
     log.info(f"  dashboard={DASHBOARD_URL}")
     log.info(f"  cpu={s['cpu_count']}c  ram={s['total_ram_gb']:.1f}G  "
              f"safe_cap={_compute_safe_capacity(s)}")
