@@ -1,0 +1,40 @@
+{
+  "summary": "Backend-only regression + new-feature testing for the RDP Worker fleet. Added /app/backend/tests/test_workers.py (16 tests) covering worker CRUD, worker Bearer auth, heartbeat, atomic claim with capacity & name-resolution semantics, progress, complete, and the new poller grace window. Ran the full backend suite (iteration_1 + new): 42 passed, 1 pre-existing skip, 0 failed in 97.75s against the public preview URL.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/workers/me/claim", "issue": "Claim loop issues N sequential find_one_and_update round-trips and a separate _resolve_names() Mongo lookup per task. Functionally correct, but for a worker pulling max_tasks=50 against a custom name-file, that is 50+ round-trips per claim call. Consider a single bulk find_and_update + memoising name resolution per name_source within one request."},
+      {"endpoint": "task_poller (server.py:828-836)", "issue": "Grace branch uses `worker_id: {\"$nin\": [None]}` which matches worker-owned tasks correctly, but after the 60s grace it marks them `status=completed` (not `failed`). The accompanying code comment says 'mark failed (worker silent)'. Behaviour is consistent and tested, but the status disagrees with the comment / intent — silent-worker tasks may want status='failed' with an `error` populated so the UI can distinguish from a happy completion."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_workers.py",
+    "/app/backend/tests/test_backend.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/workers_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Resolve the poller comment-vs-behaviour mismatch: either change the grace-out branch to `status=failed` + `error='worker timed out'`, or update the comment to match the current 'completed' semantics.",
+    "(Optional perf) Batch claim to reduce per-task Mongo round-trips when max_tasks is large.",
+    "(Optional usage accounting) Cancelled/failed tasks still hold their members against `users.usage`. If that's intentional, document it; otherwise, decrement usage on cancel/fail."
+  ],
+  "critical_code_review_comments": [
+    "server.py:828-836 — grace branch marks `completed` despite the comment saying 'failed'. Pick one; UI will look at task.status to render error rows.",
+    "server.py:587 — `range(min(max_tasks, capacity_left))` is correct but the loop body's find_one_and_update doesn't bump `current_load` on the worker. So if a worker calls /claim repeatedly between heartbeats, `capacity_left` doesn't shrink until the next heartbeat reports the new load. Consider `$inc: current_load` atomically in the same call, or rely on heartbeats coming faster than claim cadence.",
+    "server.py:582 — capacity_left snapshot is read once before the loop; race if worker heartbeats during a long claim. Minor.",
+    "server.py:826 — `'$or': [{'worker_id': None}, {'worker_id': {'$exists': False}}]` is repeated in 3 places. Extract a helper / constant.",
+    "Token format is fine, but the secret is bcrypt-hashed (~80ms per verify). On a busy poll/claim loop a worker will trigger one bcrypt verify per request. Worth knowing — consider HMAC(SHA256, server_secret) for the worker channel if QPS climbs.",
+    "Good: worker token_hash is excluded from /api/workers list via projection (verified).",
+    "Good: all worker-auth failures return string `detail`, not a Pydantic validation array (verified)."
+  ],
+  "updated_files": ["/app/backend/tests/test_workers.py"],
+  "success_rate": {"backend": "100% (16/16 new worker tests + 26/26 iteration_1 tests; 1 pre-existing skip on usage-limit)", "frontend": "not retested this iteration (100% in iteration_2)"},
+  "test_credentials": "Admin: ppandit6926@gmail.com / alok@zoom123 (seeded). BASE_URL from REACT_APP_BACKEND_URL.",
+  "seed_data_creation": "All test workers (named TEST_W_<uuid>) and tasks (meeting_id 111222333 / 999000111 / 445566778 / 778899001) are cleaned up via per-test fixtures. The worker_id index on `workers` and `tasks.worker_id` was created by startup; no manual seed needed.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Workers regression suite lives at /app/backend/tests/test_workers.py and is included by `pytest /app/backend/tests/`. Helpers `_bearer(token)` and `_unique()` plus the `workers_cleanup`/`tasks_cleanup` fixtures keep the DB clean. Worker tokens are returned ONLY on POST /api/workers — capture them then. Poller cadence is 5s and grace is 60s; tests use timeout=10 + 17s wait. The unassigned-auto-complete test does still run successfully but it shares the poller with the worker-owned test; if you run them in parallel keep them in the same class or they're independent.",
+  "rca of the issue": "N/A — no failing tests. The two minor RCA notes above (poller comment mismatch, claim doesn't $inc current_load) are observations, not failures."
+}

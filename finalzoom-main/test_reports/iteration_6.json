@@ -1,0 +1,50 @@
+{
+  "summary": "Backend testing of v8.1 PREWARM telemetry + full worker/task lifecycle. 14/14 pytest cases pass against the external preview URL. Verified: admin /auth/login cookies + /auth/me, POST /workers returns one-time token, GET /workers exposes pool_stats field, /workers/me/heartbeat persists pool_stats {browsers,total_bots,alive,ready_contexts,prewarmed}, GET /admin/fleet-health aggregates summary.prewarm {hot_browsers,ready_contexts,active_bots,prewarmed_workers} and per-worker pool_stats, /tasks/validate-credentials returns 400 on bad meeting_id and 200 on valid 10-digit, /tasks meeting_id 9-11 digit validation, /workers/me/claim returns chunked greedy assignment, /tasks/{id}/progress and /tasks/{id}/complete propagate to parent task aggregates and transition the task off /tasks/active, DELETE /workers/{id} cleans up + idempotent 404 on second delete, brute-force lockout (429) is reachable but takes ~10 attempts (not 5) due to ingress IP rotation — see RCA below.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "/api/auth/login",
+        "issue": "Brute-force lockout uses identifier=f\"{request.client.host}:{email}\". Behind the k8s ingress the upstream pod IP rotates between (observed) 2 source IPs, so it takes ~5*N=10 failed attempts (instead of 5) before 429 triggers. Attackers behind multi-NAT or with X-Forwarded-For spoofing can bypass entirely. Recommend keying lockout on email alone (or parsing X-Forwarded-For with a trusted proxy list)."
+      },
+      {
+        "endpoint": "/api/auth/login",
+        "issue": "Validation rejects emails ending in .local (pydantic reserved-name guard). Not a bug per se but worth noting for ops/tools that use .local hostnames."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_prewarm_iteration6.py",
+    "/app/test_reports/pytest/iter6_results.xml"
+  ],
+  "action_items": [
+    "Consider switching login_attempts identifier from `ip:email` to `email` (or trusted X-Forwarded-For) so brute-force lockout fires consistently at 5 attempts behind k8s ingress.",
+    "server.py is now ~1992 lines — split into modules (auth, workers, tasks, scheduler, admin, downloads) for maintainability.",
+    "DELETE /workers/{id} unassigns active tasks (worker_id->None) but does NOT release the worker's active task_chunks; chunks only get released by the stale-heartbeat poller. Add explicit chunk-release-on-delete to avoid 15s of stranded members."
+  ],
+  "critical_code_review_comments": [
+    "Rate-limiting identifier (ip:email) is unreliable behind multi-pod ingress — see RCA.",
+    "_worker_out returns pool_stats untouched (Optional[dict]). Worker can send arbitrary keys; consider a Pydantic PoolStats sub-model so the contract is enforced both ways.",
+    "admin_fleet_health does sum(...) with `_worker_status(w) == 'online'` filter — make sure _worker_status uses HEALTH_STALE_SECONDS (currently 45s) consistently with the poller's 30s online window used in /workers/me/claim. Mixing 30s vs 45s windows can show 'prewarmed_workers' > number of workers that can actually claim.",
+    "task_poller has no jitter/backoff (5s fixed); add exponential backoff on consecutive errors.",
+    "Hardcoded ROOT_DIR.parent / 'worker' path for download endpoints — convert to env var WORKER_DIR."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_prewarm_iteration6.py"
+  ],
+  "success_rate": {
+    "backend": "100% (14/14)",
+    "frontend": "not tested (backend-only request)"
+  },
+  "test_credentials": "admin@zoomservices.in / admin@zoom123 (seeded on backend startup; matches /app/memory/test_credentials.md and /app/backend/.env)",
+  "seed_data_creation": "Tests create workers named TEST_prewarm_<uuid8> and one active task with meeting_id=1234567890, password=abcd. Workers are deleted in fixture teardown; the active task is cancelled in fixture teardown.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 5 test file (test_zoom_optimizations.py) hardcoded admin@zoomdash.io / Admin@12345 — that is STALE and will fail; current admin is admin@zoomservices.in / admin@zoom123 (from /app/backend/.env). Use /app/backend/tests/test_prewarm_iteration6.py as the up-to-date regression suite. DB_NAME is 'test_database' (not 'zoom_services'). Worker python script (run_bot/BrowserPool) is NOT exercised in this container (no chromium); only the HTTP protocol contract was tested.",
+  "rca of the issue": "Brute-force lockout requires ~10 attempts instead of 5. Root cause: server.py login() builds identifier=f\"{request.client.host}:{email}\". Backend pod logs show /api/auth/login requests alternating between two upstream IPs (10.79.129.133 and 10.79.138.194), one per ingress proxy pod. Since the counter is per-IP, the threshold is effectively 5 * N_proxy_pods. Reproduction: send 20 POST /api/auth/login with same bogus email; observed responses are 10x401 then 10x429. Mitigation: change identifier to just `email`, or parse X-Forwarded-For (trusting only ingress IPs) and use the real client IP. This is a minor security finding — the lockout still engages, just at a higher attempt threshold."
+}

@@ -1,0 +1,46 @@
+{
+  "summary": "Iteration 4 — backend + frontend testing for new features: admin user management CRUD, role guards, random/no-repeat name resolution, shared admin worker fleet, worker file endpoints, and builtin pools. Added /app/backend/tests/test_admin_and_names.py (25 tests, all passing) and ran Playwright flows for admin Users page + role-based UI hiding + redirects. 25/25 backend tests pass; all UI flows pass.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/tasks", "issue": "No bare /api/tasks endpoint — only /tasks/active, /tasks/scheduled, /tasks/previous, /tasks/download. Frontend works fine since it calls the segmented endpoints, but worth noting that the review spec said 'tasks/*' (so technically passes)."},
+      {"endpoint": "POST /api/tasks (members vs usage_limit)", "issue": "If a regular user is created with usage_limit < members, task creation 400s with 'Usage limit exceeded'. Not a bug, but the user-creation flow defaults to 15000 in UI while API default also 15000 — admin lowering it to a small number can silently break user task creation. Consider a UI hint."},
+      {"endpoint": "Builtin pool 'NamesIn'", "issue": "Indian count=40 and English count=20 are tiny pools; for members>40 the cycling logic produces predictable per-block permutations. Tested and works as documented in _resolve_names — not a bug, just a callout."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Admin · Users & Credits", "issues": ["Reset usage and Delete use window.confirm() native dialogs instead of a styled in-app confirm modal — works but feels inconsistent with the rest of the dark-themed UI."]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_admin_and_names.py",
+    "/app/backend/tests/test_workers.py",
+    "/app/backend/tests/test_backend.py",
+    "/app/test_reports/pytest/admin_names_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Replace window.confirm() in AdminUsersPage with a styled confirm modal for parity with the rest of the UI.",
+    "(Optional) When admin lowers a user's usage_limit below current usage, surface a warning in the edit modal.",
+    "(Optional) Pre-existing observation from iteration_3: task_poller grace branch comment/behaviour mismatch (now resolved to 'failed' in current code — verified during this iteration)."
+  ],
+  "critical_code_review_comments": [
+    "server.py:887-898 admin_delete_user does cascading deletes AFTER the user doc is deleted; if any of the cascade calls fail mid-way, you end up with orphan tasks/workers/name_files. Wrap in try/except + log, or order: cascade first, then user.",
+    "server.py:631-663 _resolve_names() uses random.sample which is O(n) on every claim; for NamesIn (11006) this is fast but consider memoizing pool list to avoid re-copying each call.",
+    "server.py:945-950 GET /api/worker/NamesIn.txt is public (no auth). Likely intentional (worker fetches without token), but the file leaks 11k Indian names — confirm this is desired exposure.",
+    "AdminUsersPage.jsx uses window.confirm() for destructive actions; replace with in-app modal for UX consistency and testability.",
+    "TopBar.jsx renders Users/Workers links only when `isAdmin`. Good. The route guard for /workers and /admin/users also redirects non-admin to /dashboard — verified in browser test."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_admin_and_names.py"
+  ],
+  "success_rate": {"backend": "100% (25/25 new + 42/42 previous still green)", "frontend": "100% (admin CRUD, role-hiding, redirects all PASS)"},
+  "test_credentials": "Admin ppandit6926@gmail.com / alok@zoom123 (seeded). Regular users are created on the fly via /api/admin/users with TEST_ prefix and cleaned up by the fixture.",
+  "seed_data_creation": "Per-test temp_user fixture creates TEST_user_<rand>@example.com / testpass123 and tears it down with DELETE /api/admin/users/{id}. Admin worker (TEST_W_<rand>) is created and torn down by the admin_worker fixture.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Run `pytest /app/backend/tests/` for the full backend suite (test_backend.py + test_workers.py + test_admin_and_names.py = 67 tests). For UI flows, the admin CRUD modal uses data-testid='new-email-input/new-name-input/new-password-input/new-limit-input/new-role-select/create-user-submit'; edit modal uses edit-* prefix; row testids are user-row-<uid>, edit-<uid>, reset-<uid>, delete-<uid>. window.confirm is the dialog used for reset/delete — use `page.on('dialog', lambda d: asyncio.create_task(d.accept()))` BEFORE clicking. Logout sometimes does not navigate cleanly via the button; safer to call POST /api/auth/logout via fetch then page.goto('/login').",
+  "rca of the issue": "N/A — no failing tests."
+}

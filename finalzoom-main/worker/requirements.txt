@@ -1,0 +1,10 @@
+# Worker v8-pool (Playwright + browser pooling)
+requests>=2.31.0
+python-dotenv>=1.0.0
+psutil>=5.9.0
+
+# Browser automation — Playwright replaces Selenium for browser pooling
+playwright>=1.46.0
+
+# Legacy v7-lean (Selenium) still supported — uncomment if you need it:
+# selenium>=4.21.0
