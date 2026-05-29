@@ -1,54 +1,60 @@
 import { useEffect } from "react";
 import "@/App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import axios from "axios";
-import { HOME } from "@/constants/testIds";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { AuthProvider, useAuth } from "@/auth/AuthContext";
+import LoginPage from "@/pages/LoginPage";
+import DashboardPage from "@/pages/DashboardPage";
+import ClassicDashboardPage from "@/pages/ClassicDashboardPage";
+import FileEditorPage from "@/pages/FileEditorPage";
+import WorkersPage from "@/pages/WorkersPage";
+import AdminUsersPage from "@/pages/AdminUsersPage";
+import AdminTopupPage from "@/pages/AdminTopupPage";
+import AdminOverviewPage from "@/pages/AdminOverviewPage";
+import BuyCreditsPage from "@/pages/BuyCreditsPage";
+import { Toaster } from "sonner";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
+function Protected({ children, adminOnly = false }) {
+  const { user, loading } = useAuth();
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#0b0d12] text-white/60">
+        Loading...
+      </div>
+    );
+  }
+  if (!user) return <Navigate to="/login" replace />;
+  if (adminOnly && user.role !== "admin") return <Navigate to="/dashboard" replace />;
+  return children;
+}
 
-const Home = () => {
-  const helloWorldApi = async () => {
-    try {
-      const response = await axios.get(`${API}/`);
-      console.log(response.data.message);
-    } catch (e) {
-      console.error(e, `errored out requesting / api`);
-    }
-  };
-
-  useEffect(() => {
-    helloWorldApi();
-  }, []);
-
-  return (
-    <div>
-      <header className="App-header">
-        <a
-          data-testid={HOME.emergentLink}
-          className="App-link"
-          href="https://emergent.sh"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <img src="https://avatars.githubusercontent.com/in/1201222?s=120&u=2686cf91179bbafbc7a71bfbc43004cf9ae1acea&v=4" />
-        </a>
-        <p className="mt-5">Building something incredible ~!</p>
-      </header>
-    </div>
-  );
-};
+function RedirectIfAuthed({ children }) {
+  const { user, loading } = useAuth();
+  if (loading) return null;
+  if (user) return <Navigate to="/dashboard" replace />;
+  return children;
+}
 
 function App() {
   return (
     <div className="App">
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}>
-            <Route index element={<Home />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
+      <AuthProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/login" element={<RedirectIfAuthed><LoginPage /></RedirectIfAuthed>} />
+            <Route path="/dashboard" element={<Protected><DashboardPage /></Protected>} />
+            <Route path="/classic" element={<Protected><ClassicDashboardPage /></Protected>} />
+            <Route path="/file-editor" element={<Protected><FileEditorPage /></Protected>} />
+            <Route path="/buy-credits" element={<Protected><BuyCreditsPage /></Protected>} />
+            <Route path="/workers" element={<Protected adminOnly={true}><WorkersPage /></Protected>} />
+            <Route path="/admin/users" element={<Protected adminOnly={true}><AdminUsersPage /></Protected>} />
+            <Route path="/admin/topups" element={<Protected adminOnly={true}><AdminTopupPage /></Protected>} />
+            <Route path="/admin/overview" element={<Protected adminOnly={true}><AdminOverviewPage /></Protected>} />
+            <Route path="/" element={<Navigate to="/dashboard" replace />} />
+            <Route path="*" element={<Navigate to="/dashboard" replace />} />
+          </Routes>
+        </BrowserRouter>
+        <Toaster theme="dark" position="top-right" richColors />
+      </AuthProvider>
     </div>
   );
 }
