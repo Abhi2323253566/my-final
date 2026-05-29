@@ -26,8 +26,25 @@ APP_USER="finalzoom"
 DB_NAME="finalzoom"
 BACKEND_PORT="8001"
 
-: "${DOMAIN:?Set DOMAIN env (export DOMAIN=example.com)}"
-: "${EMAIL:?Set EMAIL env (export EMAIL=you@gmail.com)}"
+# DOMAIN can be either a real domain (gets SSL) OR the VPS IP (HTTP only)
+# Auto-detect: if DOMAIN is empty -> use server's public IP; if it's an IP -> HTTP mode
+if [[ -z "${DOMAIN:-}" ]]; then
+  DOMAIN="$(curl -s -4 ifconfig.me 2>/dev/null || curl -s -4 ipv4.icanhazip.com 2>/dev/null || hostname -I | awk '{print $1}')"
+  echo ">> No DOMAIN set — using detected IP: ${DOMAIN}"
+fi
+
+# Detect if DOMAIN is an IP address (skip SSL)
+if [[ "${DOMAIN}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ "${USE_IP:-0}" == "1" ]]; then
+  IS_IP_MODE=1
+  SCHEME="http"
+  EMAIL="${EMAIL:-admin@example.com}"
+  echo ">> IP mode detected — SSL will be SKIPPED, app served over HTTP"
+else
+  IS_IP_MODE=0
+  SCHEME="https"
+  : "${EMAIL:?Set EMAIL env (export EMAIL=you@gmail.com) for SSL}"
+fi
+
 : "${ADMIN_EMAIL:?Set ADMIN_EMAIL env}"
 : "${ADMIN_PASSWORD:?Set ADMIN_PASSWORD env}"
 ADMIN_NAME="${ADMIN_NAME:-Admin}"
@@ -36,7 +53,7 @@ JWT_SECRET="${JWT_SECRET:-$(openssl rand -hex 48 2>/dev/null || head -c48 /dev/u
 echo "==================================================================="
 echo " FinalZoom GitHub Installer"
 echo " Repo    : ${REPO_URL} (${REPO_BRANCH})"
-echo " Domain  : https://${DOMAIN}"
+echo " Domain  : ${SCHEME}://${DOMAIN}"
 echo " AppDir  : ${APP_DIR}"
 echo " Admin   : ${ADMIN_EMAIL}"
 echo "==================================================================="
@@ -155,7 +172,7 @@ ADMIN_EMAIL=${ADMIN_EMAIL}
 ADMIN_PASSWORD=${ADMIN_PASSWORD}
 ADMIN_NAME=${ADMIN_NAME}
 REDIS_URL=redis://127.0.0.1:6379/0
-CORS_ORIGINS=https://${DOMAIN}
+CORS_ORIGINS=${SCHEME}://${DOMAIN}
 USAGE_LIMIT=15000
 DISTRIBUTION_MODE=greedy
 HEALTH_STALE_SECONDS=45
@@ -182,7 +199,7 @@ sudo -u "${APP_USER}" bash -c "
 # ====== 7. FRONTEND BUILD =====================================================
 echo ">> [7/10] Building frontend..."
 cat > "${APP_DIR}/frontend/.env" <<EOF
-REACT_APP_BACKEND_URL=https://${DOMAIN}
+REACT_APP_BACKEND_URL=${SCHEME}://${DOMAIN}
 WDS_SOCKET_PORT=0
 EOF
 chown "${APP_USER}:${APP_USER}" "${APP_DIR}/frontend/.env"
@@ -232,11 +249,18 @@ systemctl restart "${APP_NAME}-backend"
 
 # ====== 9. NGINX + SSL ========================================================
 echo ">> [9/10] Configuring Nginx..."
+# Nginx server_name: domain ya IP dono handle hota hai
+if [[ "${IS_IP_MODE}" == "1" ]]; then
+  SERVER_NAME_LINE="server_name ${DOMAIN} _;"
+else
+  SERVER_NAME_LINE="server_name ${DOMAIN} www.${DOMAIN};"
+fi
+
 cat > "/etc/nginx/sites-available/${APP_NAME}" <<EOF
 server {
     listen 80;
     listen [::]:80;
-    server_name ${DOMAIN} www.${DOMAIN};
+    ${SERVER_NAME_LINE}
 
     client_max_body_size 50M;
 
@@ -274,13 +298,17 @@ ufw allow OpenSSH 2>/dev/null || true
 ufw allow 'Nginx Full' 2>/dev/null || true
 yes | ufw enable 2>/dev/null || true
 
-# SSL
-echo ">> Requesting Let's Encrypt SSL..."
-certbot --nginx --non-interactive --agree-tos --email "${EMAIL}" \
-  -d "${DOMAIN}" -d "www.${DOMAIN}" --redirect 2>/dev/null || \
-certbot --nginx --non-interactive --agree-tos --email "${EMAIL}" \
-  -d "${DOMAIN}" --redirect || \
-echo "!! SSL failed (DNS not pointing? www subdomain missing?). Retry manually:  certbot --nginx -d ${DOMAIN}"
+# SSL — sirf domain mode mein
+if [[ "${IS_IP_MODE}" == "0" ]]; then
+  echo ">> Requesting Let's Encrypt SSL..."
+  certbot --nginx --non-interactive --agree-tos --email "${EMAIL}" \
+    -d "${DOMAIN}" -d "www.${DOMAIN}" --redirect 2>/dev/null || \
+  certbot --nginx --non-interactive --agree-tos --email "${EMAIL}" \
+    -d "${DOMAIN}" --redirect || \
+  echo "!! SSL failed (DNS not pointing? www subdomain missing?). Retry manually:  certbot --nginx -d ${DOMAIN}"
+else
+  echo ">> IP mode — SSL skipped. App will be served over HTTP at http://${DOMAIN}"
+fi
 
 systemctl reload nginx
 
@@ -291,9 +319,9 @@ echo " STATUS"
 systemctl --no-pager --lines=0 status "${APP_NAME}-backend" || true
 echo "-------------------------------------------------------------------"
 BE_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${BACKEND_PORT}/api/" || echo "000")
-HTTPS_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "https://${DOMAIN}/" || echo "000")
+PUBLIC_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "${SCHEME}://${DOMAIN}/" || echo "000")
 echo "  Backend local : HTTP ${BE_CODE}"
-echo "  HTTPS  domain : HTTP ${HTTPS_CODE}"
+echo "  Public URL    : HTTP ${PUBLIC_CODE}  (${SCHEME}://${DOMAIN})"
 
 if [[ "${BE_CODE}" == "000" ]] || [[ "${BE_CODE}" == "502" ]]; then
   echo
@@ -303,7 +331,7 @@ fi
 echo "==================================================================="
 echo
 echo " DEPLOYMENT COMPLETE"
-echo "   Dashboard : https://${DOMAIN}"
+echo "   Dashboard : ${SCHEME}://${DOMAIN}"
 echo "   Admin     : ${ADMIN_EMAIL}"
 echo
 echo " Common commands:"
