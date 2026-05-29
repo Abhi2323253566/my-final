@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import TopBar from "@/components/TopBar";
 import { api, formatApiErrorDetail } from "@/lib/api";
-import { Server, Plus, Trash2, Copy, Cpu, MemoryStick, Activity, X, KeyRound, Download, Pencil, HeartPulse, Zap, AlertTriangle, ShieldCheck, RefreshCw } from "lucide-react";
+import { Server, Plus, Trash2, Copy, Cpu, MemoryStick, Activity, X, KeyRound, Download, Pencil, HeartPulse, Zap, AlertTriangle, ShieldCheck, RefreshCw, Layers } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/auth/AuthContext";
 
@@ -35,6 +35,11 @@ export default function WorkersPage() {
   const [editName, setEditName] = useState("");
   const [editCap, setEditCap] = useState(80);
   const [savingEdit, setSavingEdit] = useState(false);
+  // Bulk Set Capacity
+  const [showBulk, setShowBulk] = useState(false);
+  const [bulkCap, setBulkCap] = useState(80);
+  const [bulkSelected, setBulkSelected] = useState(() => new Set());
+  const [bulkSaving, setBulkSaving] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -93,6 +98,56 @@ export default function WorkersPage() {
       toast.error(formatApiErrorDetail(e.response?.data?.detail) || "Failed");
     } finally {
       setSavingEdit(false);
+    }
+  };
+
+  const openBulk = () => {
+    // Pre-select ALL workers by default (most common use case).
+    setBulkSelected(new Set(workers.map((w) => w.id)));
+    setBulkCap(80);
+    setShowBulk(true);
+  };
+
+  const toggleBulkOne = (id) => {
+    setBulkSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleBulkAll = () => {
+    setBulkSelected((prev) =>
+      prev.size === workers.length ? new Set() : new Set(workers.map((w) => w.id))
+    );
+  };
+
+  const saveBulk = async (e) => {
+    e?.preventDefault?.();
+    const cap = parseInt(bulkCap, 10);
+    if (!cap || cap < 1) return toast.error("Capacity must be >= 1");
+    if (bulkSelected.size === 0) return toast.error("Select at least one worker");
+    setBulkSaving(true);
+    try {
+      const targets = workers.filter((w) => bulkSelected.has(w.id));
+      const results = await Promise.allSettled(
+        targets.map((w) =>
+          api.patch(`/workers/${w.id}`, { name: w.name, capacity_max: cap })
+        )
+      );
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const fail = results.length - ok;
+      if (fail === 0) {
+        toast.success(`Capacity set to ${cap} on ${ok} worker${ok === 1 ? "" : "s"}`);
+      } else {
+        toast.warning(`Updated ${ok}/${results.length} workers (${fail} failed)`);
+      }
+      setShowBulk(false);
+      load();
+    } catch (e) {
+      toast.error(formatApiErrorDetail(e.response?.data?.detail) || "Bulk update failed");
+    } finally {
+      setBulkSaving(false);
     }
   };
 
@@ -182,6 +237,15 @@ SPAWN_DELAY_MS=400
             >
               <KeyRound size={14} /> Win Setup
             </a>
+            <button
+              onClick={openBulk}
+              className="zs-btn zs-btn-secondary"
+              data-testid="bulk-set-capacity-button"
+              title="Set the same capacity on multiple RDPs in one click"
+              disabled={workers.length === 0}
+            >
+              <Layers size={14} /> Bulk Set Capacity
+            </button>
             <button
               onClick={() => setShowAdd(true)}
               className="zs-btn zs-btn-primary"
@@ -573,6 +637,101 @@ SPAWN_DELAY_MS=400
                 {savingEdit ? <span className="zs-spin" /> : "Save Changes"}
               </button>
               <button type="button" onClick={() => setEditTarget(null)} className="zs-btn zs-btn-ghost">Cancel</button>
+            </div>
+          </form>
+        </Modal>
+      )}
+      {/* Bulk Set Capacity modal */}
+      {showBulk && (
+        <Modal onClose={() => setShowBulk(false)} title="Bulk Set Capacity" testid="bulk-capacity-modal">
+          <form onSubmit={saveBulk} className="space-y-4">
+            <div>
+              <div className="zs-label">New Capacity (applies to all selected RDPs)</div>
+              <input
+                className="zs-input"
+                type="number"
+                min="1"
+                max="5000"
+                value={bulkCap}
+                onChange={(e) => setBulkCap(e.target.value)}
+                autoFocus
+                data-testid="bulk-capacity-input"
+              />
+              <div className="text-xs text-white/50 mt-1.5">
+                <span className="text-emerald-300">●</span> STRICT scheduler limit per RDP. Useful when scaling 30–40 RDPs together.
+              </div>
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between mb-2">
+                <div className="zs-label !mb-0">
+                  Workers <span className="text-white/40">({bulkSelected.size}/{workers.length} selected)</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={toggleBulkAll}
+                  className="text-xs text-indigo-300 hover:text-indigo-200"
+                  data-testid="bulk-select-all-toggle"
+                >
+                  {bulkSelected.size === workers.length ? "Deselect all" : "Select all"}
+                </button>
+              </div>
+              <div className="max-h-64 overflow-y-auto rounded-lg border border-white/10 divide-y divide-white/5">
+                {workers.map((w) => {
+                  const checked = bulkSelected.has(w.id);
+                  return (
+                    <label
+                      key={w.id}
+                      className={`flex items-center gap-3 px-3 py-2 cursor-pointer text-sm ${
+                        checked ? "bg-indigo-500/10" : "hover:bg-white/5"
+                      }`}
+                      data-testid={`bulk-row-${w.id}`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleBulkOne(w.id)}
+                        className="accent-indigo-500"
+                        data-testid={`bulk-checkbox-${w.id}`}
+                      />
+                      <span className="text-white font-medium flex-1">{w.name}</span>
+                      <span
+                        className={`text-[10px] px-1.5 py-0.5 rounded ${
+                          w.status === "online"
+                            ? "bg-emerald-500/15 text-emerald-300"
+                            : "bg-amber-500/15 text-amber-300"
+                        }`}
+                      >
+                        {w.status}
+                      </span>
+                      <span className="text-xs text-white/50 font-mono whitespace-nowrap">
+                        cap {w.capacity_max}
+                      </span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="flex gap-3 pt-2">
+              <button
+                type="submit"
+                disabled={bulkSaving || bulkSelected.size === 0}
+                className="zs-btn zs-btn-primary flex-1"
+                data-testid="bulk-save-btn"
+              >
+                {bulkSaving
+                  ? <span className="zs-spin" />
+                  : `Apply to ${bulkSelected.size} RDP${bulkSelected.size === 1 ? "" : "s"}`}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowBulk(false)}
+                className="zs-btn zs-btn-ghost"
+                data-testid="bulk-cancel-btn"
+              >
+                Cancel
+              </button>
             </div>
           </form>
         </Modal>
