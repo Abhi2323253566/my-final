@@ -357,18 +357,24 @@ async def login(payload: LoginIn, response: Response, request: Request):
 
     # brute force gate
     lock = await db.login_attempts.find_one({"identifier": identifier})
+    now = datetime.now(timezone.utc)
     if lock and lock.get("locked_until"):
         locked_until = datetime.fromisoformat(lock["locked_until"])
-        if locked_until > datetime.now(timezone.utc):
+        if locked_until > now:
             raise HTTPException(status_code=429, detail="Too many failed attempts. Try again later.")
+        # Lockout window has elapsed — fully reset so a single subsequent
+        # failure doesn't immediately re-trigger the lock (count was sticky).
+        await db.login_attempts.delete_one({"identifier": identifier})
+        lock = None
 
     user = await db.users.find_one({"email": email})
     if not user or not verify_password(payload.password, user["password_hash"]):
+        new_count = (lock.get("count", 0) if lock else 0) + 1
         await db.login_attempts.update_one(
             {"identifier": identifier},
-            {"$inc": {"count": 1}, "$set": {
-                "locked_until": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
-                if (lock and lock.get("count", 0) + 1 >= 5) else None
+            {"$set": {
+                "count": new_count,
+                "locked_until": (now + timedelta(minutes=15)).isoformat() if new_count >= 5 else None,
             }},
             upsert=True,
         )
@@ -2110,6 +2116,14 @@ _poller_task: Optional[asyncio.Task] = None
 async def on_startup():
     await create_indexes()
     await seed_admin()
+    # Clear any stale login lockouts on every boot so a redeploy is enough to
+    # unstick a locked-out admin (lockouts are per-IP+email in MongoDB).
+    try:
+        res = await db.login_attempts.delete_many({})
+        if res.deleted_count:
+            log.info("Cleared %s stale login lockouts on startup", res.deleted_count)
+    except Exception as e:
+        log.warning("login_attempts cleanup skipped: %s", e)
     global _poller_task
     _poller_task = asyncio.create_task(task_poller())
 
