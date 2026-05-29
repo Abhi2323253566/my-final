@@ -17,7 +17,7 @@
 set -euo pipefail
 
 # ====== CONFIG ================================================================
-REPO_URL="${REPO_URL:-https://github.com/tradeg847-stack/finalzoom.git}"
+REPO_URL="${REPO_URL:-https://github.com/Abhi2323253566/my-final.git}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 
 APP_NAME="finalzoom"
@@ -272,7 +272,7 @@ server {
     }
 
     location /api/ {
-        proxy_pass         http://127.0.0.1:${BACKEND_PORT};
+        proxy_pass         https://afiinitysoftware.com:${BACKEND_PORT};
         proxy_http_version 1.1;
         proxy_set_header   Host \$host;
         proxy_set_header   X-Real-IP \$remote_addr;
