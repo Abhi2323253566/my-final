@@ -584,25 +584,18 @@ import secrets as _secrets
 def _effective_capacity(w: dict) -> int:
     """Return the live safe capacity for a worker.
 
-    Policy (v8.3.2 — admin cap is a HARD CEILING):
-      - `capacity_max` (set by admin in dashboard) is the hard upper limit.
-        The scheduler will NEVER assign more bots than this to the worker.
-      - `reported_capacity` (auto-computed by worker from RAM/CPU) is a
-        soft safety floor — if the machine can only handle 30 but admin
-        set 100, we use 30 (don't overload weak hardware).
-      - Effective = min(capacity_max, reported_capacity) when both present.
+    Policy (v8.3.6 — STRICT ADMIN-ONLY CEILING, ULTRA MODE):
+      - `capacity_max` (set by admin in dashboard) is the ONLY source of truth
+        for scheduling. The scheduler assigns EXACTLY up to this many bots —
+        never more, never less.
+      - `reported_capacity` (auto-computed by worker from RAM/CPU) is kept as
+        telemetry only (shown on dashboard) but is IGNORED by the scheduler.
+        Rationale: admin paid for an RDP capable of N members, so the system
+        must honour N strictly. "Auto-shrinking" caused under-utilization
+        and unwanted "auto-limited" badges.
       - If admin wants "unlimited", they set capacity_max to a big number (e.g. 5000).
     """
-    admin_cap = int(w.get("capacity_max", 100))
-    reported = w.get("reported_capacity")
-    if reported is None:
-        return admin_cap
-    try:
-        rep = max(0, int(reported))
-    except Exception:
-        return admin_cap
-    # min() honours BOTH the admin ceiling and the hardware safety floor
-    return min(admin_cap, rep)
+    return max(0, int(w.get("capacity_max", 100)))
 
 
 def _worker_out(w: dict) -> dict:
@@ -675,9 +668,9 @@ async def _get_online_worker_count(now_dt: datetime) -> int:
 
 
 async def _get_online_total_capacity(now_dt: datetime) -> int:
-    """Sum of EFFECTIVE capacity across all online workers (heartbeat in last 30s).
-    Effective capacity = `reported_capacity` (worker auto-tuned from RAM/CPU)
-    when present, else falls back to the static `capacity_max`.
+    """Sum of ADMIN-SET capacity across all online workers (heartbeat in last 30s).
+    v8.3.6: STRICT admin-only mode — we sum `capacity_max` directly and ignore
+    `reported_capacity` entirely. The admin's setting IS the capacity, period.
     Cached 5 s + Redis cluster cache. Used for capacity-weighted fair share so
     a 200-cap RDP gets more bots than a 50-cap RDP for the same task."""
     import time as _time
@@ -694,12 +687,12 @@ async def _get_online_total_capacity(now_dt: datetime) -> int:
         except Exception:
             pass
     threshold = (now_dt - timedelta(seconds=30)).isoformat()
-    # Use $ifNull to fall back to capacity_max when reported_capacity isn't set yet
+    # v8.3.6: ONLY admin-set capacity_max counts. reported_capacity is telemetry only.
     pipeline = [
         {"$match": {"last_heartbeat": {"$gte": threshold}}},
         {"$group": {
             "_id": None,
-            "total": {"$sum": {"$ifNull": ["$reported_capacity", "$capacity_max"]}},
+            "total": {"$sum": {"$ifNull": ["$capacity_max", 0]}},
         }},
     ]
     res = await db.workers.aggregate(pipeline).to_list(1)
@@ -803,8 +796,10 @@ async def worker_heartbeat(payload: HeartbeatIn, w: dict = Depends(get_current_w
         updates["hostname"] = payload.hostname
     if payload.os_info:
         updates["os_info"] = payload.os_info
-    # Worker-reported live safe capacity (computed from current free RAM + CPU on the box).
-    # This OVERRIDES the static capacity_max for fair-share + capacity_left calculations.
+    # v8.3.6 STRICT MODE: Worker-reported live safe capacity is stored as
+    # TELEMETRY ONLY (shown on dashboard). The scheduler IGNORES it and
+    # honours the admin's `capacity_max` strictly. This prevents the system
+    # from auto-shrinking the admin's chosen limit.
     if payload.reported_capacity is not None:
         rep = max(0, int(payload.reported_capacity))
         updates["reported_capacity"] = rep
@@ -889,8 +884,8 @@ async def worker_claim_tasks(
     claimed: list[dict] = []
     now_dt = datetime.now(timezone.utc)
     now_iso = now_dt.isoformat()
-    # Use the worker's live reported_capacity (auto-computed from RAM/CPU) when
-    # available; otherwise fall back to the static capacity_max.
+    # v8.3.6 STRICT: effective_capacity == admin's capacity_max (no auto-override).
+    # If admin set 1, this RDP gets exactly 1 bot — never more, never less.
     effective_cap = _effective_capacity(w)
     capacity_left = max(0, effective_cap - w.get("current_load", 0))
     if capacity_left <= 0:

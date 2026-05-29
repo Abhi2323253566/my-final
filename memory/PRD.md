@@ -113,6 +113,31 @@ Language: Hindi / Hinglish.
   RefreshCw / AlertTriangle) + "restart Xm ago" + "up Xh" so the admin
   can spot flaky RDPs across 30-40 workers at a glance. Verified live
   on the preview — all 30 sim-RDPs render `stable` badges.
+- 2026-02 (fork): **v8.3.6 — STRICT admin-capacity enforcement (Ultra Pro).**
+  User complaint: admin set `capacity_max=1` but RDP got 70 bots; UI showed
+  confusing "auto-limited" badge. Root cause: `_effective_capacity()` was
+  `min(capacity_max, reported_capacity)` so `reported_capacity` (auto-tuned
+  from worker RAM/CPU) was silently overriding the admin's intent.
+  Fixed in `/app/backend/server.py`:
+    * `_effective_capacity()` now returns `capacity_max` verbatim. `reported_capacity`
+      is kept ONLY as dashboard telemetry — scheduler ignores it.
+    * `_get_online_total_capacity()` aggregation switched from
+      `$ifNull(reported_capacity, capacity_max)` to plain `capacity_max`.
+    * Heartbeat handler still stores `reported_capacity` for display but a
+      comment makes it clear it's telemetry-only.
+  Frontend `WorkersPage.jsx`:
+    * Removed "(auto-limited)" / "(admin-cap)" badge. Card now shows clean
+      `current_load / capacity_max` (e.g. `0/80`).
+    * If the auto-detected HW value is below admin cap, a faint `hw~N` tag
+      shows for awareness — tooltip explains it's IGNORED by the scheduler.
+    * Edit modal copy rewritten: "STRICT LIMIT", "EXACTLY up to this many bots",
+      auto-detected value marked "(info only)".
+  Worker (`/app/worker/zoom_worker_pool.py`): bumped to `v8.3.6-strict-cap`
+  (os_info + boot log). Already enforces admin_cap locally when claiming.
+  Regression test: `/app/backend/tests/test_strict_capacity_v836.py`
+  (7/7 passing) — locks the policy: cap=1 stays 1, cap=80 stays 80 even if
+  worker reports 128.
+
 
 ## Known Gotchas
 - Do not revert ADMIN_EMAIL to `.local` TLD — Pydantic EmailStr will reject it

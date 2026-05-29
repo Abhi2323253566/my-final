@@ -308,15 +308,12 @@ SPAWN_DELAY_MS=400
                 </thead>
                 <tbody>
                   {workers.map((w) => {
+                    // v8.3.6 STRICT: admin's capacity_max is the ONLY scheduling limit.
+                    // reported_capacity (auto-detected) is shown as info only.
                     const adminCap = w.capacity_max || 1;
                     const autoCap = w.reported_capacity;
-                    const effectiveCap = (autoCap != null) ? Math.min(adminCap, autoCap) : adminCap;
-                    const pct = effectiveCap > 0 ? Math.round((w.current_load / effectiveCap) * 100) : 0;
-                    // v8.3.2: show admin's HARD CEILING + auto-detected, highlight whichever is binding
-                    const isAutoBinding = autoCap != null && autoCap < adminCap;
-                    const autoLabel = autoCap != null
-                      ? `${w.current_load}/${effectiveCap} ${isAutoBinding ? "(auto-limited)" : "(admin-cap)"}`
-                      : `${w.current_load}/${adminCap}`;
+                    const pct = adminCap > 0 ? Math.round((w.current_load / adminCap) * 100) : 0;
+                    const loadLabel = `${w.current_load}/${adminCap}`;
                     const ps = w.pool_stats || null;
                     return (
                       <tr key={w.id} data-testid={`worker-row-${w.id}`}>
@@ -332,7 +329,15 @@ SPAWN_DELAY_MS=400
                             <div className="flex-1 h-2 bg-white/10 rounded-full overflow-hidden">
                               <div className={`h-full ${pct > 85 ? "bg-red-500" : pct > 60 ? "bg-amber-500" : "bg-emerald-500"}`} style={{ width: `${pct}%` }} />
                             </div>
-                            <span className="text-xs text-white/70 font-mono whitespace-nowrap" data-testid={`worker-cap-${w.id}`}>{autoLabel}</span>
+                            <span className="text-xs text-white/70 font-mono whitespace-nowrap" data-testid={`worker-cap-${w.id}`}>{loadLabel}</span>
+                            {autoCap != null && autoCap < adminCap && (
+                              <span
+                                className="text-[10px] text-white/40 font-mono whitespace-nowrap"
+                                title={`Auto-detected hardware safe-cap: ${autoCap}. Scheduler IGNORES this — admin limit is strictly enforced.`}
+                              >
+                                hw~{autoCap}
+                              </span>
+                            )}
                           </div>
                         </td>
                         <td data-testid={`worker-pool-${w.id}`}>
@@ -435,13 +440,13 @@ SPAWN_DELAY_MS=400
         <div className="zs-card-2 p-5 mt-6 border-l-4 border-amber-500/60">
           <h2 className="text-white font-bold text-lg mb-3 flex items-center gap-2">
             <Activity size={18} className="text-amber-400" />
-            Already running an older worker on Linux VPS? Migrate to v8.3.2
+            Already running an older worker on Linux VPS? Migrate to v8.3.6
           </h2>
           <div className="text-white/80 text-sm space-y-3">
             <p>
               SSH into your existing VPS as <code className="text-amber-300">root</code> and paste this <b>one command</b>.
               It will <span className="text-emerald-300">stop the old worker</span>, <span className="text-emerald-300">preserve your WORKER_TOKEN</span>,
-              install <span className="text-emerald-300">v8.3.2</span> (tap-and-join + admin-cap), and register a <span className="text-emerald-300">systemd service</span> for auto-restart.
+              install <span className="text-emerald-300">v8.3.6</span> (strict admin-cap + green-screen fix + tap-and-join), and register a <span className="text-emerald-300">systemd service</span> for auto-restart.
             </p>
             <div className="zs-card p-3 font-mono text-xs text-emerald-300 flex items-center justify-between gap-3">
               <code className="break-all" data-testid="migrate-command">
@@ -463,7 +468,7 @@ SPAWN_DELAY_MS=400
               <li>Backs up old <code>.env</code> and <code>zoom_worker_pool.py</code> with timestamps before overwriting</li>
               <li>If <code>WORKER_TOKEN</code> is missing it will prompt — paste from the dashboard</li>
               <li>After: <code className="text-cyan-300">systemctl status zoom-worker</code> and <code className="text-cyan-300">tail -f /var/log/zoom-worker.log</code></li>
-              <li>Dashboard should show <span className="text-emerald-300">v8.3.2-admin-cap</span> in the Pool column within ~30s</li>
+              <li>Dashboard should show <span className="text-emerald-300">v8.3.6-strict-cap</span> in the OS column within ~30s</li>
             </ul>
           </div>
         </div>
@@ -542,10 +547,10 @@ SPAWN_DELAY_MS=400
             </div>
             <div>
               <div className="zs-label flex items-center justify-between">
-                <span>Max Capacity <span className="text-amber-300">(HARD CEILING)</span></span>
+                <span>Max Capacity <span className="text-amber-300">(STRICT LIMIT)</span></span>
                 {editTarget.reported_capacity != null && (
                   <span className="text-[11px] font-normal text-white/50">
-                    Auto-detected by RDP: <b className="text-cyan-300">{editTarget.reported_capacity}</b>
+                    HW auto-detected: <b className="text-cyan-300">{editTarget.reported_capacity}</b> <span className="text-white/30">(info only)</span>
                   </span>
                 )}
               </div>
@@ -553,13 +558,13 @@ SPAWN_DELAY_MS=400
                 onChange={(e) => setEditCap(e.target.value)} data-testid="edit-worker-capacity-input" />
               <div className="text-xs text-white/50 mt-1.5 space-y-1">
                 <div>
-                  <span className="text-emerald-300">●</span> Scheduler will <b className="text-white">NEVER</b> assign more than this number of bots to this RDP. Once reached → next worker picks up.
+                  <span className="text-emerald-300">●</span> Scheduler will assign <b className="text-white">EXACTLY up to this many bots</b> to this RDP — no auto-shrinking, no auto-override.
                 </div>
                 <div>
-                  <span className="text-white/40">●</span> Effective = <code className="text-indigo-300">min(this value, auto-detected)</code> — protects weak hardware AND respects your billing cap.
+                  <span className="text-white/40">●</span> Set <code>1</code> → exactly 1 bot. Set <code>100</code> → up to 100 bots. Set <code>5000</code> → effectively unlimited.
                 </div>
                 <div className="text-white/40">
-                  <span>●</span> Want unlimited? Set this to <code>5000</code> (max).
+                  <span>●</span> Hardware auto-detected value is shown for reference only and is NOT used for distribution.
                 </div>
               </div>
             </div>

@@ -1,0 +1,39 @@
+{
+  "summary": "v8.3.6 STRICT admin-capacity enforcement validated end-to-end. All 16 tests passed: 7 unit (test_strict_capacity_v836.py) + 9 HTTP integration (test_strict_capacity_api_v836.py, newly added). Verified the smoking-gun fix: PATCH cap=1 + heartbeat reported_capacity=70 → GET /api/workers still returns capacity_max=1 (admin is law). High (200) and low (5) reported values both stored as telemetry but never override capacity_max. fleet-health endpoint OK (no regression).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "server.py", "issue": "FastAPI @app.on_event('startup'/'shutdown') deprecated — use lifespan handlers. Cosmetic only."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_strict_capacity_v836.py",
+    "/app/backend/tests/test_strict_capacity_api_v836.py",
+    "/app/test_reports/pytest/strict_capacity_v836.xml",
+    "/app/test_reports/pytest/strict_capacity_api_v836.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "_effective_capacity() at server.py:584 cleanly returns max(0, int(capacity_max)) and ignores reported_capacity — correct STRICT policy.",
+    "Heartbeat handler (line 803-805) properly stores reported_capacity as TELEMETRY ONLY without touching capacity_max — matches policy.",
+    "PATCH /api/workers/{id} validates 1<=cap<=5000 (line 776) — good guardrail.",
+    "server.py is 2078 lines — exceeds 700-line guideline; consider splitting workers/tasks/admin into separate routers.",
+    "Deprecated FastAPI on_event hooks at lines 2052 and 2060 — migrate to lifespan context manager.",
+    "GET /api/workers excludes _id and token_hash via projection (line 738) — good Mongo hygiene."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_strict_capacity_api_v836.py (NEW — 9 HTTP integration tests)"
+  ],
+  "success_rate": {"backend": "100% (16/16)", "frontend": "skipped per request"},
+  "test_credentials": "admin@finalzoom.com / Admin@FinalZoom2026 (worked first try via cookie session)",
+  "seed_data_creation": "Each test creates a TEST_strict_cap_<uuid> worker via POST /api/workers and deletes it in teardown — no residue.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "test_strict_capacity_api_v836.py is the regression suite for STRICT capacity enforcement at the HTTP layer. It uses requests.Session() for the cookie auth and a fresh worker per test class. Heartbeat is at POST /api/workers/me/heartbeat (Bearer token), NOT /api/workers/{id}/heartbeat as the original problem statement suggested. Task-claim respects cap via _effective_capacity at server.py:889 and 1704.",
+  "rca of the issue": "Pre-v8.3.6: scheduler used min(capacity_max, reported_capacity) which let RDP-reported live values shrink the admin's chosen ceiling (and a stale/buggy reported value once inflated it to 70 vs admin cap=1). Fix in _effective_capacity (server.py:598) now returns max(0, int(capacity_max)) verbatim. reported_capacity remains stored as telemetry for dashboard display only. Verified via PATCH→heartbeat→GET round-trip across cap values {1, 10, 50, 100} with reported_capacity in {5, 70, 200}."
+}

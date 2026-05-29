@@ -995,7 +995,7 @@ def heartbeat(load_override: int, capacity_override: Optional[int] = None,
         "cpu_pct": s["cpu_pct"],
         "ram_pct": s["ram_pct"],
         "hostname": socket.gethostname(),
-        "os_info": f"{platform.system()} {platform.release()} (Playwright v8.3.5-no-green-screen)",
+        "os_info": f"{platform.system()} {platform.release()} (Playwright v8.3.6-strict-cap)",
         "cpu_count": s["cpu_count"],
         "ram_free_gb": round(s["free_ram_gb"], 2),
     }
@@ -1574,7 +1574,7 @@ async def main():
                 pass
 
     s = _machine_specs()
-    log.info(f"Zoom Worker v8.3.5 (headless + muted-join + offscreen + no-camera-perm) starting")
+    log.info(f"Zoom Worker v8.3.6 (STRICT admin cap + muted-join + no-camera-perm) starting")
     log.info(f"  dashboard={DASHBOARD_URL}")
     log.info(f"  cpu={s['cpu_count']}c  ram={s['total_ram_gb']:.1f}G  "
              f"safe_cap={_compute_safe_capacity(s)}")
