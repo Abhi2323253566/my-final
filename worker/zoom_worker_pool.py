@@ -1459,8 +1459,20 @@ async def run_bot(slot: BotSlot, browser_slot: BrowserSlot, meeting_id: str,
         slot.joined_at = time.time()
         await _post_join_optimize(page)
 
+        # ===== START REACTIONS SIDE-COROUTINE (if enabled) =====
+        if reactions_on:
+            try:
+                reaction_task = asyncio.create_task(
+                    _reaction_loop(page, slot, r_min, r_max)
+                )
+                log.info(f"[{slot.name}] reactions ON ({r_min}-{r_max}s)")
+            except Exception as e:
+                log.debug(f"[{slot.name}] could not start reaction loop: {e}")
+                reaction_task = None
+
         # Hold + monitor for kick / cancel
         end = time.time() + hold_seconds
+        import random as _rb
         while time.time() < end and not slot.closed:
             await asyncio.sleep(15)
             try:
@@ -1468,31 +1480,84 @@ async def run_bot(slot: BotSlot, browser_slot: BrowserSlot, meeting_id: str,
             except Exception:
                 break
             if not in_room:
-                # Within kick window? attempt rejoin.
-                if (time.time() - slot.joined_at) <= KICK_DETECT_WINDOW and slot.rejoins < BOT_REJOIN_MAX:
+                # STRICT anti-leave: keep rejoining for the ENTIRE meeting hold.
+                # Legacy mode only attempts rejoin within KICK_DETECT_WINDOW.
+                within_kick_window = (time.time() - slot.joined_at) <= KICK_DETECT_WINDOW
+                can_rejoin = (
+                    slot.rejoins < BOT_REJOIN_MAX
+                    and (STRICT_ANTI_LEAVE or within_kick_window)
+                )
+                if can_rejoin:
                     slot.rejoins += 1
-                    log.info(f"[{slot.name}] kicked, rejoin {slot.rejoins}/{BOT_REJOIN_MAX}")
+                    log.info(f"[{slot.name}] dropped, rejoin {slot.rejoins}/{BOT_REJOIN_MAX} "
+                             f"(strict={STRICT_ANTI_LEAVE})")
                     try:
+                        # random backoff so 50 bots don't hammer Zoom at once
+                        await asyncio.sleep(_rb.uniform(REJOIN_BACKOFF_MIN, REJOIN_BACKOFF_MAX))
                         if await _join_meeting(page, meeting_id, password, slot.name):
                             slot.joined_at = time.time()
                             await _post_join_optimize(page)
                             continue
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug(f"[{slot.name}] rejoin err: {e}")
+                # exhausted attempts → exit hold
                 break
         return True
     finally:
-        # ===== AUTO CLEANUP: meeting ended → close page + context =====
-        try:
-            if slot.page:
-                await slot.page.close()
-        except Exception: pass
-        try:
-            if slot.context:
-                await slot.context.close()
-        except Exception: pass
+        # ===== STOP REACTIONS first =====
+        if reaction_task is not None:
+            try:
+                reaction_task.cancel()
+            except Exception:
+                pass
+
+        # ===== RECYCLE CONTEXT (tab warming) =====
+        # Instead of closing the BrowserContext at meeting end, we blank the
+        # page and hand the context back to the prewarm ready pool. Next task
+        # picks up an already-warmed tab → massive CPU/time saver.
+        if (RECYCLE_CONTEXT_ON_END and pool is not None
+                and slot.context is not None and slot.page is not None
+                and browser_slot is not None and browser_slot.alive
+                and not slot.closed):
+            try:
+                # Best-effort: navigate to about:blank to drop the Zoom meeting
+                # JS context + free media handles, then push back to ready pool.
+                try:
+                    await asyncio.wait_for(
+                        slot.page.goto("about:blank", timeout=3000),
+                        timeout=4.0
+                    )
+                except Exception:
+                    pass
+                rc = ReadyContext(
+                    browser_slot=browser_slot,
+                    context=slot.context,
+                    page=slot.page,
+                )
+                async with pool.lock:
+                    # Respect the warm-pool ceiling — drop overflow.
+                    if len(pool.ready) < pool.target_max:
+                        pool.ready.append(rc)
+                        recycled_to_pool = True
+                if recycled_to_pool:
+                    log.debug(f"[{slot.name}] context recycled to ready pool")
+            except Exception as e:
+                log.debug(f"[{slot.name}] recycle failed, falling back to close: {e}")
+                recycled_to_pool = False
+
+        # ===== AUTO CLEANUP (only if NOT recycled) =====
+        if not recycled_to_pool:
+            try:
+                if slot.page:
+                    await slot.page.close()
+            except Exception: pass
+            try:
+                if slot.context:
+                    await slot.context.close()
+            except Exception: pass
         slot.closed = True
-        browser_slot.bots.pop(slot.name, None)
+        if browser_slot is not None:
+            browser_slot.bots.pop(slot.name, None)
 
 
 # ---------------------------------------------------------------- task runner
@@ -1550,7 +1615,8 @@ class TaskRunner:
             bot_slots.append(slot)
 
             runners.append(asyncio.create_task(
-                run_bot(slot, browser_slot, meeting_id, password, timeout_sec, pool=self.pool)
+                run_bot(slot, browser_slot, meeting_id, password, timeout_sec,
+                        pool=self.pool, task_cfg=task)
             ))
             # tiny stagger so chromium doesn't get hammered
             await asyncio.sleep(SPAWN_DELAY_MS / 1000.0)

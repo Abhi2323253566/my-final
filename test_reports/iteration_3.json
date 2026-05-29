@@ -1,0 +1,48 @@
+{
+  "summary": "v8.4.0 round-robin/even distribution + new reaction config fields validated. All 7 backend tests pass (test_round_robin_distribution_v840.py). Auth on REACT_APP_BACKEND_URL, POST /api/tasks persistence of participant_reactions/floating_emoji/reaction_interval_min/reaction_interval_max, even distribution across 3 simulated workers, strict capacity_max=10 enforcement on /workers/me/claim, and GET /api/workers shape (capacity_max + reported_capacity) all verified.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "POST /api/tasks",
+        "issue": "Review request mentions distribution_mode='round_robin' as a task-level field but TaskCreate model (server.py:200) does NOT define it. Pydantic silently ignores the extra key — request succeeds but the value is never persisted. distribution mode is a GLOBAL backend env var (DISTRIBUTION_MODE in /app/backend/.env). If per-task distribution is intended, the field must be added to TaskCreate + TaskOut + task doc."
+      },
+      {
+        "endpoint": "DISTRIBUTION_MODE env",
+        "issue": "Current /app/backend/.env sets DISTRIBUTION_MODE=\"auto\" (not \"round_robin\"). Code default if env unset is \"round_robin\" (server.py:881). The round-robin per-cycle wave_cap (ROUND_ROBIN_TAKE_PER_CYCLE=1) is therefore NOT active in this deployment. \"auto\" still does strict equal split, so even distribution works — but the visual wave pattern documented at server.py:984-994 will not appear."
+      },
+      {
+        "endpoint": "GET /api/tasks/{id}",
+        "issue": "No endpoint exists. Single-task read is only possible via /tasks/active or /tasks/previous list scans. Tests fall back to /tasks/active."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_round_robin_distribution_v840.py",
+    "/app/test_reports/pytest/rr_distribution_v840.xml"
+  ],
+  "action_items": [
+    "Decide if distribution_mode should be a per-task field (then add to TaskCreate/TaskOut + persist + read in worker_claim_tasks) OR remove the mention from the problem statement.",
+    "Optionally flip /app/backend/.env DISTRIBUTION_MODE from 'auto' to 'round_robin' if the wave-cap behaviour is the desired UX. Today the system does an EQUAL split via the 'auto' branch which is functionally correct for the 'no single worker takes everything' requirement.",
+    "Consider adding a GET /api/tasks/{task_id} endpoint for single-task reads (helps frontends + tests)."
+  ],
+  "critical_code_review_comments": [
+    "worker_claim_tasks (server.py:887) correctly enforces equal_share = ceil(members/online_count) when DISTRIBUTION_MODE in (auto, even, round_robin). my_already tracking via task_chunks aggregate prevents repeated polls from one worker grabbing more than fair-share — verified empirically: 3 test workers each got exactly 23 bots when 4 workers were online (90/4=22.5 -> ceil=23) instead of one greedily taking 90.",
+    "_effective_capacity (line 609) returns int(capacity_max) verbatim — strict admin policy, validated: cap=10 worker received exactly 10 bots in one claim even though reported_capacity=200 and 200 bots were pending.",
+    "TaskCreate (server.py:200) Pydantic model has NO `extra` config, so unknown fields like distribution_mode are silently dropped. Either explicitly forbid extras (extra='forbid') for clearer API errors, or add distribution_mode as a real field if per-task mode is intended.",
+    "server.py is 2118 lines — still well over the 700-line guideline. Split workers/tasks/admin/auth into separate routers.",
+    "FastAPI on_event hooks (line 2052, 2060) remain deprecated — migrate to lifespan context manager.",
+    "Pre-existing live worker named '1' (cap=80) was heartbeating during tests; round-robin algorithm correctly included it in online_count so each of our 3 test workers got fair-share=23 instead of 30. Algorithm behaves correctly under realistic mixed workload."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_round_robin_distribution_v840.py (NEW — 7 tests covering auth + new task fields + even distribution + strict cap + workers list shape)"
+  ],
+  "success_rate": {"backend": "100% (7/7)", "frontend": "skipped per request"},
+  "test_credentials": "admin@finalzoom.com / Admin@FinalZoom2026 — works first try via cookie auth on https://vps-deploy-guide-3.preview.emergentagent.com.",
+  "seed_data_creation": "Each test spins up TEST_-prefixed workers + a transient task via /api/tasks then deletes both in teardown (DELETE /api/workers/{id} and DELETE /api/tasks/{id}). No residue.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "test_round_robin_distribution_v840.py is the v8.4 regression suite. Important quirk: the deployment has a real worker '1' polling /workers/me/claim continuously, so online_count is always >= 4. The distribution test detects this and recomputes the expected fair-share = ceil(90/online_count). When no external workers are online, the test asserts the 3 test workers sum to exactly 90. DISTRIBUTION_MODE='auto' currently; for the wave-cap behaviour you must export DISTRIBUTION_MODE='round_robin' (and restart backend).",
+  "rca of the issue": "Initial test failure (each worker stuck at 23 bots, total=69 of 90) was NOT a bug — it was a real online worker named '1' heartbeating during the test, making online_count=4 instead of 3. equal_share = ceil(90/4) = 23, so the algorithm correctly bounded each worker at 23. Test updated to compute expected fair-share from live online_count. Algorithm correctness is confirmed: no single-worker greed, even split per-worker, all 90 distributed across all online workers (test 3 + live 1 = 4 workers = 23+23+23+21=90)."
+}

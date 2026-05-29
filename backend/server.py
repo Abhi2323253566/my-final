@@ -997,7 +997,17 @@ async def worker_claim_tasks(
         # task has unclaimed members — prevents tiny tasks (e.g. 10 bots on
         # 30 workers) from leaving most workers idle while a few grab all.
         fair_share_total = max(fair_share_total, 1)
-        fair_share_left = max(0, fair_share_total - my_already)
+
+        # v8.4.1 HARD PER-TASK PER-WORKER CEILING:
+        # A worker must NEVER claim more bots from a single task than its admin
+        # capacity_max. Without this, when bots leave naturally the worker's
+        # current_load drops and the server happily ships the remaining bots
+        # to the same RDP — overshooting its limit.
+        # Example: 1 RDP cap=80, task=100 → first claim 80, then as bots leave
+        # the server was re-claiming the remaining 20 onto the same RDP.
+        # With this ceiling, the RDP gets exactly 80 from this task, ever.
+        per_task_worker_ceiling = min(effective_cap, fair_share_total)
+        fair_share_left = max(0, per_task_worker_ceiling - my_already)
 
         # MOP-UP: only triggers if the task has clearly stalled. We track the
         # task's `last_claim_at` (updated below on every successful claim). If
@@ -1023,14 +1033,19 @@ async def worker_claim_tasks(
         in_mopup = secs_since_last_claim > mopup_stall_secs
 
         if DISTRIBUTION_MODE == "greedy":
-            # Sequential fill: this worker takes as much as it can RIGHT NOW.
-            take = min(remaining, capacity_left)
+            # Sequential fill: this worker takes as much as it can RIGHT NOW —
+            # but STILL respect the per-task per-worker ceiling so a single
+            # RDP can't blow past its admin-set capacity_max on one task.
+            greedy_room = max(0, per_task_worker_ceiling - my_already)
+            take = min(remaining, capacity_left, greedy_room)
         elif in_mopup:
             # MOP-UP: task is stalled (no claims for >stall_secs). Release the
             # strict fair-share cap but keep a soft 2× fair_share limit so a
-            # single worker can't slurp all remaining bots.
+            # single worker can't slurp all remaining bots. Per-worker ceiling
+            # still applies — capacity_max is sacred.
             soft_cap = max(1, fair_share_total * 2)
-            take = min(remaining, capacity_left, soft_cap)
+            mopup_room = max(0, per_task_worker_ceiling - my_already)
+            take = min(remaining, capacity_left, soft_cap, mopup_room)
         else:
             if fair_share_left <= 0:
                 # Already took our fair share for this task — try next task in
