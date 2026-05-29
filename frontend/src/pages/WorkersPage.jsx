@@ -301,7 +301,9 @@ SPAWN_DELAY_MS=400
                     <th>Name</th><th>Status</th><th>Load / Capacity</th>
                     <th>Pool</th>
                     <th>CPU</th><th>RAM</th><th>Hostname</th><th>OS</th>
-                    <th>Last Heartbeat</th><th>Action</th>
+                    <th>Last Heartbeat</th>
+                    <th title="Crash count from keep-alive supervisor + last restart time">Stability</th>
+                    <th>Action</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -372,6 +374,13 @@ SPAWN_DELAY_MS=400
                         <td className="text-white/70 font-mono text-xs">{w.hostname || "-"}</td>
                         <td className="text-white/70 text-xs">{w.os_info || "-"}</td>
                         <td className="text-white/60 text-xs">{fmt(w.last_heartbeat)}</td>
+                        <td data-testid={`worker-stability-${w.id}`}>
+                          <StabilityBadge
+                            crashes={w.crash_count}
+                            lastRestart={w.last_restart_at}
+                            startedAt={w.worker_started_at}
+                          />
+                        </td>
                         <td>
                           <div className="flex gap-1.5">
                             <button onClick={() => openEdit(w)}
@@ -593,3 +602,47 @@ function FleetStat({ label, value, accent = "text-white", icon, hint, testid }) 
     </div>
   );
 }
+
+// Stability heatmap pill for the workers table — shows the keep-alive
+// supervisor's crash count plus when it last had to restart main_loop and
+// how long the worker process has been up. Zero crashes = green, 1-2 = amber,
+// 3+ = red. Gives the operator a one-glance heatmap across 40 RDPs.
+function StabilityBadge({ crashes, lastRestart, startedAt }) {
+  const c = Number.isFinite(crashes) ? crashes : 0;
+  let tone, label, Icon;
+  if (c === 0) {
+    tone = "bg-emerald-500/10 text-emerald-300 border-emerald-500/30";
+    label = "stable";
+    Icon = ShieldCheck;
+  } else if (c <= 2) {
+    tone = "bg-amber-500/10 text-amber-300 border-amber-500/30";
+    label = `${c} crash${c > 1 ? "es" : ""}`;
+    Icon = RefreshCw;
+  } else {
+    tone = "bg-red-500/15 text-red-300 border-red-500/40";
+    label = `${c} crashes`;
+    Icon = AlertTriangle;
+  }
+  const restartRel = relTime(lastRestart);
+  const upRel = relTime(startedAt);
+  return (
+    <div className="flex flex-col gap-0.5 min-w-[110px]">
+      <span
+        className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[11px] font-medium w-fit ${tone}`}
+        title={lastRestart ? `Last restart: ${fmt(lastRestart)}` : "Never restarted"}
+      >
+        <Icon size={11} />
+        {label}
+      </span>
+      {c > 0 && restartRel && (
+        <span className="text-[10px] text-white/50 font-mono">restart {restartRel}</span>
+      )}
+      {upRel && (
+        <span className="text-[10px] text-white/40 font-mono" title={`Worker booted ${fmt(startedAt)}`}>
+          up {upRel}
+        </span>
+      )}
+    </div>
+  );
+}
+

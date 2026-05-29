@@ -79,7 +79,6 @@ Language: Hindi / Hinglish.
 - Production: https://vps-deploy-guide-3.emergent.host
 
 ## Backlog (P0 → P2)
-- P1: Live RDP-health dashboard (RAM/CPU per worker) for managing 30+ RDPs.
 - P1: Auto-mark workers offline after `HEALTH_STALE_SECONDS` so claim()'s
   `online_count` is always accurate without manual cleanup (suggested by
   testing agent in iteration_1).
@@ -106,6 +105,14 @@ Language: Hindi / Hinglish.
 - 2026-02 (fork): E2E backend smoke test added at
   `/app/backend/tests/test_e2e_smoke.py` — 9/9 passing, covers auth +
   task lifecycle + 30 & 40-worker fair-distribution regression.
+- 2026-02 (fork): **RDP Health Heatmap shipped.** Backend `/workers` +
+  `/admin/fleet-health` now surface per-RDP `crash_count`,
+  `last_restart_at`, `worker_started_at` from the keep-alive supervisor,
+  plus a fleet-wide `unstable` count. `WorkersPage.jsx` gained a new
+  "Stability" column with a green/amber/red badge (ShieldCheck /
+  RefreshCw / AlertTriangle) + "restart Xm ago" + "up Xh" so the admin
+  can spot flaky RDPs across 30-40 workers at a glance. Verified live
+  on the preview — all 30 sim-RDPs render `stable` badges.
 
 ## Known Gotchas
 - Do not revert ADMIN_EMAIL to `.local` TLD — Pydantic EmailStr will reject it
