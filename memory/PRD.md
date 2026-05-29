@@ -79,12 +79,33 @@ Language: Hindi / Hinglish.
 - Production: https://vps-deploy-guide-3.emergent.host
 
 ## Backlog (P0 → P2)
-- P1: Run `testing_agent_v3_fork` for end-to-end coverage of auth, tasks,
-  workers, name-files, admin overview, topup flows.
 - P1: Live RDP-health dashboard (RAM/CPU per worker) for managing 30+ RDPs.
+- P1: Auto-mark workers offline after `HEALTH_STALE_SECONDS` so claim()'s
+  `online_count` is always accurate without manual cleanup (suggested by
+  testing agent in iteration_1).
+- P2: Refactor `/app/backend/server.py` (2049 lines) into modules:
+  auth, tasks, workers, claim, admin, name-files, topup.
 - P2: Produce a step-by-step VPS deployment guide (Docker Compose +
   Nginx reverse proxy + MongoDB + Supervisor) for the user's own server.
+- P2: Standardise worker-action endpoints under `/api/workers/me/*`
+  (today: progress is `PATCH /api/tasks/{id}/progress` and complete is
+  `POST /api/tasks/{id}/complete`) — doc-only inconsistency, no bug.
 - P2: Optionally add a healthcheck endpoint and /api/version surfacing.
+
+## Changelog
+- 2026-02 (fork): Fixed worker_claim_tasks starvation bug — corrected
+  equal-share math + raised MOP-UP threshold (>15s). Distribution test
+  passes for 30 / 35 / 40 worker scenarios.
+- 2026-02 (fork): Ultra-optimised `zoom_worker.py` Selenium launch flags
+  (background-throttling, memory-pressure, renderer-process-limit, V8
+  heap cap, consolidated --disable-features, etc.) and added a forceful
+  keep-alive supervisor that wraps `main_loop()` with exponential
+  backoff so the worker auto-restarts on any crash without manual
+  intervention. `run_task()` now also has a top-level try/except that
+  reports failure + frees the slot if the inner runner crashes.
+- 2026-02 (fork): E2E backend smoke test added at
+  `/app/backend/tests/test_e2e_smoke.py` — 9/9 passing, covers auth +
+  task lifecycle + 30 & 40-worker fair-distribution regression.
 
 ## Known Gotchas
 - Do not revert ADMIN_EMAIL to `.local` TLD — Pydantic EmailStr will reject it
