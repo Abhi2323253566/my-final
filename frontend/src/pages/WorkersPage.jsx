@@ -40,6 +40,9 @@ export default function WorkersPage() {
   const [bulkCap, setBulkCap] = useState(80);
   const [bulkSelected, setBulkSelected] = useState(() => new Set());
   const [bulkSaving, setBulkSaving] = useState(false);
+  // Bulk mode: "fixed" = same capacity to all selected, "auto" = split total bots evenly across selected RDPs
+  const [bulkMode, setBulkMode] = useState("fixed");
+  const [bulkTotalBots, setBulkTotalBots] = useState(1000);
 
   const load = useCallback(async () => {
     try {
@@ -105,6 +108,8 @@ export default function WorkersPage() {
     // Pre-select ALL workers by default (most common use case).
     setBulkSelected(new Set(workers.map((w) => w.id)));
     setBulkCap(80);
+    setBulkMode("fixed");
+    setBulkTotalBots(1000);
     setShowBulk(true);
   };
 
@@ -122,23 +127,60 @@ export default function WorkersPage() {
     );
   };
 
+  // Compute even distribution of `total` bots across the selected workers.
+  // Base = floor(total/N); first R workers get (base+1) where R = total % N.
+  // Sorted by worker name so the assignment is deterministic & previewable.
+  const computeAutoDistribution = (total, selectedIds) => {
+    const targets = workers
+      .filter((w) => selectedIds.has(w.id))
+      .slice()
+      .sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+    const n = targets.length;
+    if (n === 0 || !total || total < 1) return [];
+    const base = Math.floor(total / n);
+    const remainder = total - base * n;
+    return targets.map((w, i) => ({
+      worker: w,
+      capacity: Math.max(1, base + (i < remainder ? 1 : 0)),
+    }));
+  };
+
   const saveBulk = async (e) => {
     e?.preventDefault?.();
-    const cap = parseInt(bulkCap, 10);
-    if (!cap || cap < 1) return toast.error("Capacity must be >= 1");
     if (bulkSelected.size === 0) return toast.error("Select at least one worker");
+
+    // Build [{worker, capacity}] depending on the chosen mode.
+    let plan = [];
+    if (bulkMode === "auto") {
+      const total = parseInt(bulkTotalBots, 10);
+      if (!total || total < 1) return toast.error("Total bots must be >= 1");
+      plan = computeAutoDistribution(total, bulkSelected);
+      if (plan.length === 0) return toast.error("Nothing to distribute");
+    } else {
+      const cap = parseInt(bulkCap, 10);
+      if (!cap || cap < 1) return toast.error("Capacity must be >= 1");
+      plan = workers
+        .filter((w) => bulkSelected.has(w.id))
+        .map((w) => ({ worker: w, capacity: cap }));
+    }
+
     setBulkSaving(true);
     try {
-      const targets = workers.filter((w) => bulkSelected.has(w.id));
       const results = await Promise.allSettled(
-        targets.map((w) =>
-          api.patch(`/workers/${w.id}`, { name: w.name, capacity_max: cap })
+        plan.map(({ worker, capacity }) =>
+          api.patch(`/workers/${worker.id}`, { name: worker.name, capacity_max: capacity })
         )
       );
       const ok = results.filter((r) => r.status === "fulfilled").length;
       const fail = results.length - ok;
       if (fail === 0) {
-        toast.success(`Capacity set to ${cap} on ${ok} worker${ok === 1 ? "" : "s"}`);
+        if (bulkMode === "auto") {
+          const total = plan.reduce((s, p) => s + p.capacity, 0);
+          toast.success(`Distributed ${total} bots across ${ok} RDP${ok === 1 ? "" : "s"}`);
+        } else {
+          const cap = plan[0]?.capacity;
+          toast.success(`Capacity set to ${cap} on ${ok} worker${ok === 1 ? "" : "s"}`);
+        }
       } else {
         toast.warning(`Updated ${ok}/${results.length} workers (${fail} failed)`);
       }
@@ -643,24 +685,60 @@ SPAWN_DELAY_MS=400
       )}
       {/* Bulk Set Capacity modal */}
       {showBulk && (
-        <Modal onClose={() => setShowBulk(false)} title="Bulk Set Capacity" testid="bulk-capacity-modal">
+        <Modal onClose={() => setShowBulk(false)} title="Bulk Set Capacity" testid="bulk-capacity-modal" wide>
           <form onSubmit={saveBulk} className="space-y-4">
-            <div>
-              <div className="zs-label">New Capacity (applies to all selected RDPs)</div>
-              <input
-                className="zs-input"
-                type="number"
-                min="1"
-                max="5000"
-                value={bulkCap}
-                onChange={(e) => setBulkCap(e.target.value)}
-                autoFocus
-                data-testid="bulk-capacity-input"
-              />
-              <div className="text-xs text-white/50 mt-1.5">
-                <span className="text-emerald-300">●</span> STRICT scheduler limit per RDP. Useful when scaling 30–40 RDPs together.
-              </div>
+            {/* Mode tabs: Fixed vs Smart Auto-Distribute */}
+            <div className="flex p-1 bg-white/5 rounded-lg border border-white/10" data-testid="bulk-mode-tabs">
+              <button
+                type="button"
+                onClick={() => setBulkMode("fixed")}
+                className={`flex-1 px-3 py-2 rounded-md text-sm font-medium transition ${
+                  bulkMode === "fixed"
+                    ? "bg-indigo-500/20 text-indigo-200 border border-indigo-500/40"
+                    : "text-white/60 hover:text-white"
+                }`}
+                data-testid="bulk-mode-fixed"
+              >
+                Fixed Capacity
+              </button>
+              <button
+                type="button"
+                onClick={() => setBulkMode("auto")}
+                className={`flex-1 px-3 py-2 rounded-md text-sm font-medium transition flex items-center justify-center gap-1.5 ${
+                  bulkMode === "auto"
+                    ? "bg-emerald-500/20 text-emerald-200 border border-emerald-500/40"
+                    : "text-white/60 hover:text-white"
+                }`}
+                data-testid="bulk-mode-auto"
+              >
+                <Zap size={13} /> Smart Auto-Distribute
+              </button>
             </div>
+
+            {bulkMode === "fixed" ? (
+              <div>
+                <div className="zs-label">New Capacity (applies to all selected RDPs)</div>
+                <input
+                  className="zs-input"
+                  type="number"
+                  min="1"
+                  max="5000"
+                  value={bulkCap}
+                  onChange={(e) => setBulkCap(e.target.value)}
+                  autoFocus
+                  data-testid="bulk-capacity-input"
+                />
+                <div className="text-xs text-white/50 mt-1.5">
+                  <span className="text-emerald-300">●</span> STRICT scheduler limit per RDP. Same value on every selected RDP.
+                </div>
+              </div>
+            ) : (
+              <AutoDistributePanel
+                totalBots={bulkTotalBots}
+                setTotalBots={setBulkTotalBots}
+                plan={computeAutoDistribution(parseInt(bulkTotalBots, 10) || 0, bulkSelected)}
+              />
+            )}
 
             <div>
               <div className="flex items-center justify-between mb-2">
@@ -679,6 +757,10 @@ SPAWN_DELAY_MS=400
               <div className="max-h-64 overflow-y-auto rounded-lg border border-white/10 divide-y divide-white/5">
                 {workers.map((w) => {
                   const checked = bulkSelected.has(w.id);
+                  // In auto mode, show the per-RDP allocation right on the row.
+                  const autoPlan = bulkMode === "auto"
+                    ? computeAutoDistribution(parseInt(bulkTotalBots, 10) || 0, bulkSelected).find((p) => p.worker.id === w.id)
+                    : null;
                   return (
                     <label
                       key={w.id}
@@ -707,6 +789,15 @@ SPAWN_DELAY_MS=400
                       <span className="text-xs text-white/50 font-mono whitespace-nowrap">
                         cap {w.capacity_max}
                       </span>
+                      {autoPlan && checked && (
+                        <span
+                          className="text-xs text-emerald-300 font-mono whitespace-nowrap"
+                          data-testid={`bulk-auto-plan-${w.id}`}
+                          title="New capacity after Smart Auto-Distribute"
+                        >
+                          → {autoPlan.capacity}
+                        </span>
+                      )}
                     </label>
                   );
                 })}
@@ -722,7 +813,9 @@ SPAWN_DELAY_MS=400
               >
                 {bulkSaving
                   ? <span className="zs-spin" />
-                  : `Apply to ${bulkSelected.size} RDP${bulkSelected.size === 1 ? "" : "s"}`}
+                  : bulkMode === "auto"
+                    ? `Distribute ${parseInt(bulkTotalBots, 10) || 0} bots → ${bulkSelected.size} RDP${bulkSelected.size === 1 ? "" : "s"}`
+                    : `Apply to ${bulkSelected.size} RDP${bulkSelected.size === 1 ? "" : "s"}`}
               </button>
               <button
                 type="button"
@@ -740,16 +833,87 @@ SPAWN_DELAY_MS=400
   );
 }
 
-function Modal({ children, onClose, title, testid }) {
+function Modal({ children, onClose, title, testid, wide = false }) {
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={onClose} data-testid={testid}>
-      <div className="zs-card-2 p-6 max-w-md w-full" onClick={(e) => e.stopPropagation()}>
+      <div className={`zs-card-2 p-6 w-full ${wide ? "max-w-lg" : "max-w-md"}`} onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-white font-bold text-lg">{title}</h3>
           <button onClick={onClose} className="text-white/60 hover:text-white" aria-label="Close"><X size={18} /></button>
         </div>
         {children}
       </div>
+    </div>
+  );
+}
+
+// ===== Smart Auto-Distribute preview panel =====
+// Shows the math summary (total / N RDPs = base + remainder spillover)
+// plus min/max per-RDP so the operator can sanity-check before applying.
+function AutoDistributePanel({ totalBots, setTotalBots, plan }) {
+  const n = plan.length;
+  const total = parseInt(totalBots, 10) || 0;
+  const caps = plan.map((p) => p.capacity);
+  const sum = caps.reduce((s, c) => s + c, 0);
+  const min = caps.length ? Math.min(...caps) : 0;
+  const max = caps.length ? Math.max(...caps) : 0;
+  const base = n > 0 ? Math.floor(total / n) : 0;
+  const remainder = n > 0 ? total - base * n : 0;
+
+  return (
+    <div className="space-y-3" data-testid="auto-distribute-panel">
+      <div>
+        <div className="zs-label">Total Bots to Distribute</div>
+        <input
+          className="zs-input"
+          type="number"
+          min="1"
+          max="100000"
+          value={totalBots}
+          onChange={(e) => setTotalBots(e.target.value)}
+          autoFocus
+          data-testid="bulk-total-bots-input"
+        />
+        <div className="text-xs text-white/50 mt-1.5">
+          <span className="text-emerald-300">●</span> Will be split <b>evenly</b> across all selected RDPs. Remainder spreads across the first few alphabetically.
+        </div>
+      </div>
+
+      {n > 0 ? (
+        <div
+          className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3 text-sm"
+          data-testid="auto-distribute-preview"
+        >
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-emerald-300 font-semibold flex items-center gap-1.5">
+              <Zap size={14} /> Distribution Preview
+            </span>
+            <span className="text-white/50 text-xs font-mono" data-testid="auto-distribute-math">
+              {total} ÷ {n} = {base}{remainder > 0 ? ` (+1 on first ${remainder})` : ""}
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-xs">
+            <div className="bg-white/5 rounded p-2">
+              <div className="text-white/40 uppercase tracking-wider text-[10px]">Min / RDP</div>
+              <div className="text-white font-mono text-base" data-testid="auto-distribute-min">{min}</div>
+            </div>
+            <div className="bg-white/5 rounded p-2">
+              <div className="text-white/40 uppercase tracking-wider text-[10px]">Max / RDP</div>
+              <div className="text-white font-mono text-base" data-testid="auto-distribute-max">{max}</div>
+            </div>
+            <div className="bg-white/5 rounded p-2">
+              <div className="text-white/40 uppercase tracking-wider text-[10px]">Total Sum</div>
+              <div className={`font-mono text-base ${sum === total ? "text-emerald-300" : "text-amber-300"}`} data-testid="auto-distribute-sum">
+                {sum}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-amber-200" data-testid="auto-distribute-empty">
+          Select at least one worker below to preview the distribution.
+        </div>
+      )}
     </div>
   );
 }

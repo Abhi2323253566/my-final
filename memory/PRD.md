@@ -40,6 +40,16 @@ User language: Hindi / Hinglish. Tone: confident, "Ultra Pro", ultra-accommodati
 - `GET  /api/tasks/active|scheduled|previous`
 
 ## Changelog
+- **2026-02 — Smart Auto-Distribute (Bulk Capacity)**:
+  `WorkersPage.jsx` Bulk modal now has two modes via tab toggle —
+  (a) **Fixed Capacity** (existing behaviour: same cap on every selected RDP),
+  (b) **Smart Auto-Distribute**: operator enters Total Bots (e.g. 1000) and
+  the UI evenly splits it across selected RDPs using
+  `base = floor(total/N)` with remainder spilled into the first R workers
+  (sorted alphabetically) so `sum === total` exactly.
+  Live preview shows `total ÷ N = base (+1 on first R)`, min/max/sum and
+  per-row `→ capacity` allocations. Apply patches each worker independently
+  via `PATCH /api/workers/:id`.
 - **2026-02 — Fake media flags restored (user request)**:
   Both `--use-fake-ui-for-media-stream` AND `--use-fake-device-for-media-stream`
   now in `CHROMIUM_ARGS` so Zoom shows mic + camera icons on each bot tile.
@@ -55,8 +65,7 @@ User language: Hindi / Hinglish. Tone: confident, "Ultra Pro", ultra-accommodati
 
 ## Pending / Backlog
 - P1: Re-deploy production via Emergent **Deploy** button so DB seed + worker
-  flags go live.
-- P2: "Bulk Set Capacity" button on `WorkersPage.jsx`.
+  flags + Smart Auto-Distribute UI go live.
 - P2: Reaction toggle wiring smoke test once user OKs further testing.
 
 ## Constraints
