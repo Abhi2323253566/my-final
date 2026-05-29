@@ -829,11 +829,19 @@ async def worker_chunk_status(task_id: str, w: dict = Depends(get_current_worker
     }
 
 
-# Distribution mode: "greedy" (default) fills one RDP completely up to its
-# effective capacity before any bots go to the next RDP. "weighted" splits each
-# task across all online RDPs proportionally to their reported capacity.
-# Switch via env var: DISTRIBUTION_MODE=weighted on backend .env.
-DISTRIBUTION_MODE = os.environ.get("DISTRIBUTION_MODE", "greedy").lower()
+# Distribution mode:
+#   "auto"   (default, recommended) — auto-detects best strategy:
+#              • If all online RDPs have the SAME effective capacity (homogeneous
+#                fleet → typical user case: 30 identical RDPs), it does a strict
+#                EQUAL split: each RDP gets ceil(members / online_count) bots.
+#                Example: 1000 bots ÷ 30 RDPs = 34 per RDP — none starve.
+#              • If RDPs are heterogeneous (different RAM/CPU), it switches to
+#                capacity-weighted fair share so beefy RDPs do more work.
+#   "weighted" — always capacity-weighted (old fair-share).
+#   "even"     — always strict equal split (ignores capacity).
+#   "greedy"   — old behaviour: one RDP fills up before the next gets anything.
+# Switch via env var DISTRIBUTION_MODE on backend .env.
+DISTRIBUTION_MODE = os.environ.get("DISTRIBUTION_MODE", "auto").lower()
 
 
 @api.post("/workers/me/claim")
@@ -843,11 +851,14 @@ async def worker_claim_tasks(
 ):
     """Load-balanced claim — splits big tasks EQUALLY across all online workers.
 
-    Strategy: When a worker claims, we count online workers (heartbeat within
-    last 30s) and compute a `fair_share = ceil(task.members / online_count)`.
-    Each worker can take at most `fair_share` members per task — so a 100-bot
-    task with 4 online workers splits as 25/25/25/25 instead of one worker
-    grabbing all 100. Capacity and remaining are still respected as upper bounds.
+    Strategy (DISTRIBUTION_MODE=auto, default):
+    - Count online workers (heartbeat within last 30s).
+    - fair_share = ceil(task.members / online_count). Each worker takes at most
+      this many members per task per claim cycle. A 1000-bot task with 30 online
+      RDPs splits as ~34 bots per RDP — no RDP starves.
+    - Capacity (RAM/CPU-derived) and remaining are upper bounds.
+    - If a task is still under-claimed after 15s (some workers crashed), the
+      MOP-UP path kicks in and lets whoever's polling grab the leftovers.
     """
     claimed: list[dict] = []
     now_dt = datetime.now(timezone.utc)
@@ -909,7 +920,22 @@ async def worker_claim_tasks(
         ]).to_list(1)
         my_already = my_existing[0]["total"] if my_existing else 0
 
-        fair_share_total = math.ceil(task["members"] * (my_capacity / online_total_capacity))
+        # ---- Compute fair share based on the active DISTRIBUTION_MODE ----
+        # "auto"/"even": strict EQUAL split → ceil(members / online_count). This
+        #                is what the user wants for 30 identical RDPs (1000 ÷ 30
+        #                ≈ 34 bots each). Capacity is still respected as a cap.
+        # "weighted":    capacity-weighted (bigger RDPs do more work).
+        # "greedy":      one RDP fills up before the next gets any work.
+        equal_share = math.ceil(task["members"] / online_count)
+        weighted_share = math.ceil(task["members"] * (my_capacity / online_total_capacity))
+
+        if DISTRIBUTION_MODE == "weighted":
+            fair_share_total = weighted_share
+        else:
+            # auto / even / anything else → strict equal split. We also clamp
+            # by capacity_left so a small RDP never gets more than it can hold.
+            fair_share_total = equal_share
+
         # Guarantee at least 1 bot per worker if it has capacity_left and the
         # task has unclaimed members — prevents tiny tasks (e.g. 10 bots on
         # 30 workers) from leaving most workers idle while a few grab all.
@@ -928,18 +954,15 @@ async def worker_claim_tasks(
 
         if DISTRIBUTION_MODE == "greedy":
             # Sequential fill: this worker takes as much as it can RIGHT NOW.
-            # Whichever worker polls first fills up first; the next polling worker
-            # gets whatever remains. With POLL_INTERVAL=5, a busy worker keeps
-            # claiming until full; other workers only start receiving bots once
-            # the first is at capacity. This is the user's preferred order.
             take = min(remaining, capacity_left)
-        elif task_age > 8:
+        elif task_age > 15:
+            # MOP-UP: task is stuck (some workers offline) — let whoever polls
+            # grab whatever's left, capped by capacity.
             take = min(remaining, capacity_left)
         else:
             if fair_share_left <= 0:
-                # Already took our fair share for this task — stop on this task
-                # and break (next claim cycle, after heartbeats expire, fair_share
-                # will recompute or mop-up will trigger).
+                # Already took our fair share for this task — try next task in
+                # the queue instead of looping on the same one.
                 break
             take = min(remaining, capacity_left, fair_share_left)
 

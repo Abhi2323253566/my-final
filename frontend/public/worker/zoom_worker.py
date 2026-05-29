@@ -65,6 +65,15 @@ LOCAL_NAMES_FILE = os.environ.get("LOCAL_NAMES_FILE", "").strip()
 if not DASHBOARD_URL or not WORKER_TOKEN:
     print("ERROR: DASHBOARD_URL and WORKER_TOKEN must be set in .env"); sys.exit(1)
 
+# Hard cap on parallel browser launches per RDP. Chrome warm-up is the single
+# most expensive step (~2-4s CPU spike + 250-400 MB RAM). On large tasks the
+# RDP can crash if 30+ chromes spin up at once. We gate every bot's webdriver
+# creation through this semaphore — typical safe value 3.
+BROWSER_WARMUP_LIMIT = max(1, int(os.environ.get("BROWSER_WARMUP_LIMIT", "3")))
+# Grace period (sec) between detecting "meeting has ended" and the bot's
+# driver.quit(). Gives Zoom time to flush UI state cleanly before we tear down.
+MEETING_END_GRACE_SEC = int(os.environ.get("MEETING_END_GRACE_SEC", "5"))
+
 API = f"{DASHBOARD_URL}/api"
 HEADERS = {"Authorization": f"Bearer {WORKER_TOKEN}", "Content-Type": "application/json"}
 
@@ -183,6 +192,92 @@ RECONNECT_MAX_ATTEMPTS = int(os.environ.get("RECONNECT_MAX_ATTEMPTS", "5"))
 RECONNECT_DELAY_SEC    = int(os.environ.get("RECONNECT_DELAY_SEC", "5"))
 
 
+def _inject_strict_media_stubs(driver):
+    """Override navigator.mediaDevices.getUserMedia to ALWAYS return a silent
+    audio track + a black video track. Even if Zoom or a misconfigured flag
+    requests a real device, the bot will broadcast pure silence and a blank
+    frame — no "tu tu" mic feedback, no green-screen camera artifacts.
+
+    This is injected via CDP so it runs *before* any Zoom JS on every page —
+    Zoom can't bypass it by re-requesting a track.
+    """
+    js = r"""
+    (function() {
+      try {
+        const origGUM = (navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
+          ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices) : null;
+
+        function silentAudioTrack() {
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          const dst = ctx.createMediaStreamDestination();
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          gain.gain.value = 0;                // pure silence
+          osc.connect(gain).connect(dst);
+          osc.start();
+          const track = dst.stream.getAudioTracks()[0];
+          try { track.enabled = false; } catch(e){}
+          return track;
+        }
+        function blackVideoTrack() {
+          const c = document.createElement('canvas');
+          c.width = 320; c.height = 240;
+          const g = c.getContext('2d');
+          g.fillStyle = '#000'; g.fillRect(0, 0, c.width, c.height);
+          const stream = c.captureStream(1);   // 1 fps black canvas
+          const track = stream.getVideoTracks()[0];
+          try { track.enabled = false; } catch(e){}
+          return track;
+        }
+
+        navigator.mediaDevices.getUserMedia = function(constraints) {
+          return new Promise(function(resolve, reject) {
+            try {
+              const tracks = [];
+              if (constraints && constraints.audio) tracks.push(silentAudioTrack());
+              if (constraints && constraints.video) tracks.push(blackVideoTrack());
+              const ms = new MediaStream(tracks);
+              resolve(ms);
+            } catch (e) {
+              if (origGUM) return origGUM(constraints).then(resolve, reject);
+              reject(e);
+            }
+          });
+        };
+
+        // Also stub the legacy getUserMedia variants Zoom may probe
+        ['getUserMedia','webkitGetUserMedia','mozGetUserMedia'].forEach(function(k){
+          if (navigator[k]) {
+            navigator[k] = function(c, s, f){
+              navigator.mediaDevices.getUserMedia(c).then(s, f);
+            };
+          }
+        });
+
+        // Hide enumerateDevices labels so Zoom doesn't pick a real device
+        if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+          const origED = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+          navigator.mediaDevices.enumerateDevices = function() {
+            return origED().then(function(list){
+              return list.map(function(d){ return { kind: d.kind, label: '', deviceId: d.deviceId, groupId: d.groupId }; });
+            });
+          };
+        }
+      } catch(e) { /* swallow — best effort stub */ }
+    })();
+    """
+    # CDP: run on every new document BEFORE Zoom scripts execute
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": js})
+    except Exception:
+        pass
+    # Also run on the current page (in case CDP isn't available)
+    try:
+        driver.execute_script(js)
+    except Exception:
+        pass
+
+
 def _build_chrome_opts(headless: bool, chrome_bin: str, profile_dir: str) -> ChromeOptions:
     opts = ChromeOptions()
     if headless:
@@ -193,15 +288,20 @@ def _build_chrome_opts(headless: bool, chrome_bin: str, profile_dir: str) -> Chr
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--mute-audio")  # chrome-level audio mute
-    opts.add_argument("--window-size=1280,720")
-    # Fake-device flags keep Zoom from blocking the join because of "no
-    # mic/cam". The fake device is a black frame + silence — exactly what
-    # we want a "silent muted bot" to broadcast. We additionally click the
-    # pre-join Mute/Stop-Video toggles, so the bot also *appears* muted &
-    # camera-off to the host.
+    opts.add_argument("--mute-audio")  # chrome-level audio mute (output)
+    # ---- STRICT MUTE / CAMERA OFF FLAGS ----
+    # Force fake silent audio + black video device at the *driver* level — even
+    # if Zoom tries to grab the mic, it gets pure silence. No "tu tu" leak.
     opts.add_argument("--use-fake-ui-for-media-stream")
     opts.add_argument("--use-fake-device-for-media-stream")
+    # Tell Chrome to register fake-mic + fake-cam permissions automatically.
+    opts.add_argument("--enable-usermedia-screen-capturing")
+    opts.add_argument("--allow-running-insecure-content")
+    # Disable any auto audio capture from system/loopback
+    opts.add_argument("--disable-features=AudioServiceOutOfProcess,WebRtcHideLocalIpsWithMdns")
+    opts.add_argument("--disable-webrtc-hw-encoding")
+    opts.add_argument("--disable-webrtc-hw-decoding")
+    opts.add_argument("--window-size=1280,720")
     opts.add_argument("--autoplay-policy=no-user-gesture-required")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--disable-notifications")
@@ -357,11 +457,16 @@ def _attempt_join(driver, meeting_id: str, password: str, name: str) -> bool:
 # This runs in its OWN process (mp.Process) — fully isolated Chrome + Selenium
 def bot_process(meeting_id: str, password: str, name: str, hold_seconds: int,
                 headless: bool, chrome_bin: str, joined_event: 'mp.synchronize.Event',
-                task_prefix: str = ""):
+                task_prefix: str = "", warmup_sem: 'mp.synchronize.Semaphore' = None):
     """Single bot — join Zoom meeting muted & camera off, force-stay until the
     host ends the meeting OR ``hold_seconds`` budget runs out. On unexpected
     disconnects (driver crash, transient network), the bot transparently
     rebuilds Chrome and rejoins (up to ``RECONNECT_MAX_ATTEMPTS`` times).
+
+    ``warmup_sem`` (cross-process mp.Semaphore) gates the expensive Chrome
+    launch + page-load step so at most ``BROWSER_WARMUP_LIMIT`` bots are
+    spinning up Chrome simultaneously on this RDP. Prevents RAM/CPU spikes
+    on large tasks (30+ concurrent bots).
     """
     import tempfile as _tf
     pfx = f"zb-{task_prefix}-" if task_prefix else "zb-"
@@ -374,11 +479,26 @@ def bot_process(meeting_id: str, password: str, name: str, hold_seconds: int,
         attempts += 1
         profile_dir = _tf.mkdtemp(prefix=pfx)
         driver = None
+        sem_acquired = False
         try:
+            # ---- Warm-up gate: max BROWSER_WARMUP_LIMIT chrome launches at a time
+            if warmup_sem is not None:
+                warmup_sem.acquire()
+                sem_acquired = True
             opts = _build_chrome_opts(headless, chrome_bin, profile_dir)
             driver = _start_driver(opts)
 
+            # Inject strict silent-audio + black-video stubs BEFORE Zoom JS runs
+            _inject_strict_media_stubs(driver)
+
             _attempt_join(driver, meeting_id, password, name)
+
+            # Release warm-up slot as soon as join is in-progress (we don't
+            # need to hold the semaphore for the entire force-stay loop).
+            if sem_acquired and warmup_sem is not None:
+                try: warmup_sem.release()
+                except Exception: pass
+                sem_acquired = False
 
             # Signal "joined" to parent on FIRST successful attempt only
             if not joined_event.is_set():
@@ -396,6 +516,15 @@ def bot_process(meeting_id: str, password: str, name: str, hold_seconds: int,
                 # Did the host end the meeting / kick us out?
                 if _meeting_has_ended(driver):
                     meeting_naturally_ended = True
+                    # Grace window so Zoom can flush UI state cleanly before
+                    # we tear down — user-configured (MEETING_END_GRACE_SEC,
+                    # default 5s). After this, the finally block calls
+                    # driver.quit() and the process exits.
+                    try:
+                        print(f"[bot {name}] meeting ended — cleaning up in {MEETING_END_GRACE_SEC}s", flush=True)
+                    except Exception:
+                        pass
+                    time.sleep(MEETING_END_GRACE_SEC)
                     break
             else:
                 # Loop fell through because deadline hit
@@ -408,6 +537,11 @@ def bot_process(meeting_id: str, password: str, name: str, hold_seconds: int,
             try: print(f"[bot {name}] attempt {attempts} error: {type(e).__name__}: {str(e)[:140]}", flush=True)
             except Exception: pass
         finally:
+            # Always release warm-up slot if we still hold it (e.g. exception
+            # during driver creation) — otherwise other bots would deadlock.
+            if sem_acquired and warmup_sem is not None:
+                try: warmup_sem.release()
+                except Exception: pass
             try:
                 if driver: driver.quit()
             except Exception: pass
@@ -449,6 +583,11 @@ def run_task(task: dict):
     processes: List[mp.Process] = []
     joined_events: List[mp.synchronize.Event] = []
 
+    # Cross-process semaphore: caps simultaneous Chrome warm-ups on this RDP.
+    # Default 3 — every bot acquires before webdriver.Chrome() and releases
+    # right after _attempt_join finishes. Prevents RAM/CPU spike on big tasks.
+    warmup_sem = mp.Semaphore(BROWSER_WARMUP_LIMIT)
+
     with RUNNING_LOCK:
         RUNNING[task_id] = {"processes": processes, "joined": 0, "started_at": time.time(), "prefix": task_prefix}
 
@@ -459,7 +598,7 @@ def run_task(task: dict):
         joined_events.append(ev)
         p = mp.Process(
             target=bot_process,
-            args=(meeting_id, password, names[i], timeout_sec, HEADLESS, CHROME_BIN, ev, task_prefix),
+            args=(meeting_id, password, names[i], timeout_sec, HEADLESS, CHROME_BIN, ev, task_prefix, warmup_sem),
             daemon=True,
         )
         p.start()
