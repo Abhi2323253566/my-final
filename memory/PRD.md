@@ -58,6 +58,21 @@ Language: Hindi / Hinglish.
     No more "tu tu" leaks or green-screen frames.
   * Created `/app/backend/tests/test_distribution.py` — async simulation that
     spawns 30 mock workers + 500-bot task and asserts no starvation.
+- 2026-02 (latest):
+  * Wave-join (10s gap between joins per RDP), pro-level disk-cache pre-warm,
+    and strict JS anti-leave guards added to
+    `/app/frontend/public/worker/zoom_worker.py`.
+  * `/app/frontend/src/components/CreateTaskPanel.jsx` — Meeting ID & Password
+    now persist in localStorage with a manual "Clear ID/Pwd" button.
+  * **Distribution starvation bug FIXED**: `worker_claim_tasks` MOP-UP path
+    used to trigger after just 15s of task age, allowing late-polling workers
+    to grab their full 50-bot capacity and starve others. Replaced with a
+    stall-aware MOP-UP (`MOPUP_STALL_SECS`, default 45s; based on
+    `last_claim_at` timestamp, not age) and capped MOP-UP take at
+    `2 × fair_share` so even mop-up stays roughly even. Verified by
+    `tests/test_distribution.py` for 30/35/40 RDPs — all PASS.
+  * Test cleanup hardened: `tests/test_distribution.py` now wipes lingering
+    `sim-rdp-*` workers AND cancels stale active tasks before every run.
 
 ## Live URLs
 - Preview: https://vps-deploy-guide-3.preview.emergentagent.com

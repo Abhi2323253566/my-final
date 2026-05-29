@@ -857,8 +857,9 @@ async def worker_claim_tasks(
       this many members per task per claim cycle. A 1000-bot task with 30 online
       RDPs splits as ~34 bots per RDP — no RDP starves.
     - Capacity (RAM/CPU-derived) and remaining are upper bounds.
-    - If a task is still under-claimed after 15s (some workers crashed), the
-      MOP-UP path kicks in and lets whoever's polling grab the leftovers.
+    - If no worker has claimed from the task for >45s (MOPUP_STALL_SECS), the
+      MOP-UP path kicks in: workers may take up to 2× fair_share so the task
+      can finish even when some RDPs crash mid-claim.
     """
     claimed: list[dict] = []
     now_dt = datetime.now(timezone.utc)
@@ -942,9 +943,11 @@ async def worker_claim_tasks(
         fair_share_total = max(fair_share_total, 1)
         fair_share_left = max(0, fair_share_total - my_already)
 
-        # MOP-UP: if the task is old enough (>15s) and still has unclaimed
-        # members, bypass the fair-share cap. This recovers tasks where some
-        # workers crashed or are slow to poll.
+        # MOP-UP: only triggers if the task has clearly stalled. We track the
+        # task's `last_claim_at` (updated below on every successful claim). If
+        # no worker has claimed for MOP_UP_STALL_SECS (default 45s), we assume
+        # some workers crashed and release the cap — but only up to 2× the
+        # fair share per worker so distribution stays reasonable.
         task_age = 0.0
         try:
             task_started = datetime.fromisoformat(task.get("started_at", now_iso))
@@ -952,19 +955,33 @@ async def worker_claim_tasks(
         except Exception:
             pass
 
+        last_claim_at_raw = task.get("last_claim_at") or task.get("started_at")
+        secs_since_last_claim = task_age
+        try:
+            if last_claim_at_raw:
+                last_claim_dt = datetime.fromisoformat(last_claim_at_raw)
+                secs_since_last_claim = (now_dt - last_claim_dt).total_seconds()
+        except Exception:
+            pass
+        mopup_stall_secs = int(os.environ.get("MOPUP_STALL_SECS", "45"))
+        in_mopup = secs_since_last_claim > mopup_stall_secs
+
         if DISTRIBUTION_MODE == "greedy":
             # Sequential fill: this worker takes as much as it can RIGHT NOW.
             take = min(remaining, capacity_left)
-        elif task_age > 15:
-            # MOP-UP: task is stuck (some workers offline) — let whoever polls
-            # grab whatever's left, capped by capacity.
-            take = min(remaining, capacity_left)
+        elif in_mopup:
+            # MOP-UP: task is stalled (no claims for >stall_secs). Release the
+            # strict fair-share cap but keep a soft 2× fair_share limit so a
+            # single worker can't slurp all remaining bots.
+            soft_cap = max(1, fair_share_total * 2)
+            take = min(remaining, capacity_left, soft_cap)
         else:
             if fair_share_left <= 0:
                 # Already took our fair share for this task — try next task in
                 # the queue instead of looping on the same one.
                 break
             take = min(remaining, capacity_left, fair_share_left)
+        log.debug(f"[CLAIM] w={w['name']} task={task['id'][:8]} online={online_count} eq_share={equal_share} my_already={my_already} cap_left={capacity_left} rem={remaining} age={task_age:.1f}s mopup={in_mopup} take={take}")
 
         if take <= 0:
             break
@@ -976,7 +993,7 @@ async def worker_claim_tasks(
         # rollback just the overshoot amount.
         doc_after = await db.tasks.find_one_and_update(
             {"id": task["id"], "$expr": {"$lt": [{"$ifNull": ["$members_claimed", 0]}, "$members"]}},
-            {"$inc": {"members_claimed": take}},
+            {"$inc": {"members_claimed": take}, "$set": {"last_claim_at": now_iso}},
             return_document=True,
             projection={"_id": 0, "members_claimed": 1, "members": 1},
         )

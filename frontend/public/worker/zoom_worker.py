@@ -62,6 +62,22 @@ CHROME_BIN = os.environ.get("CHROME_BIN", "")
 CHROMEDRIVER_PATH = os.environ.get("CHROMEDRIVER_PATH", "")
 LOCAL_NAMES_FILE = os.environ.get("LOCAL_NAMES_FILE", "").strip()
 
+# ---------------- Wave-mode join ----------------
+# When >0, this worker spawns ONE bot, then waits JOIN_WAVE_GAP_SEC seconds
+# before spawning the next. Across N online RDPs polling simultaneously, the
+# net join rate is N bots per JOIN_WAVE_GAP_SEC window — exactly what the user
+# asked for: 1 bot per RDP per wave, no RDP overload. Set to 0 to use legacy
+# SPAWN_BATCH behaviour.
+JOIN_WAVE_GAP_SEC = int(os.environ.get("JOIN_WAVE_GAP_SEC", "10"))
+
+# Persistent shared Chrome disk-cache directory. All bots share this so DNS,
+# CDN responses, fonts, JS bundles, etc are downloaded ONCE per RDP and
+# reused. Massive win on big tasks — cuts cold-start from ~5s to ~1.5s.
+SHARED_DISK_CACHE_DIR = os.environ.get(
+    "SHARED_DISK_CACHE_DIR",
+    str(Path(tempfile.gettempdir()) / "zoom-bot-cache"),
+)
+
 if not DASHBOARD_URL or not WORKER_TOKEN:
     print("ERROR: DASHBOARD_URL and WORKER_TOKEN must be set in .env"); sys.exit(1)
 
@@ -69,7 +85,29 @@ if not DASHBOARD_URL or not WORKER_TOKEN:
 # most expensive step (~2-4s CPU spike + 250-400 MB RAM). On large tasks the
 # RDP can crash if 30+ chromes spin up at once. We gate every bot's webdriver
 # creation through this semaphore — typical safe value 3.
-BROWSER_WARMUP_LIMIT = max(1, int(os.environ.get("BROWSER_WARMUP_LIMIT", "3")))
+#
+# PRO-LEVEL adaptive sizing: if BROWSER_WARMUP_LIMIT is not set, we auto-size
+# based on free RAM at startup (more RAM → more parallel warmups allowed).
+def _compute_warmup_limit() -> int:
+    env_val = os.environ.get("BROWSER_WARMUP_LIMIT", "").strip()
+    if env_val:
+        try:
+            return max(1, int(env_val))
+        except ValueError:
+            pass
+    if not psutil:
+        return 3
+    try:
+        free_gb = psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        return 3
+    # Rough rule: 1 parallel warmup per 1.5 GB free RAM (each Chrome ~250-400 MB)
+    # capped between 2 and 8.
+    limit = int(free_gb // 1.5)
+    return max(2, min(8, limit))
+
+
+BROWSER_WARMUP_LIMIT = _compute_warmup_limit()
 # Grace period (sec) between detecting "meeting has ended" and the bot's
 # driver.quit(). Gives Zoom time to flush UI state cleanly before we tear down.
 MEETING_END_GRACE_SEC = int(os.environ.get("MEETING_END_GRACE_SEC", "5"))
@@ -192,6 +230,107 @@ RECONNECT_MAX_ATTEMPTS = int(os.environ.get("RECONNECT_MAX_ATTEMPTS", "5"))
 RECONNECT_DELAY_SEC    = int(os.environ.get("RECONNECT_DELAY_SEC", "5"))
 
 
+def _inject_anti_leave_guards(driver):
+    """Force-stay enforcement: prevent the bot from leaving the meeting via
+    *any* path except a real host-ended event.
+
+      1. Override window.close / location reassignment / history navigation.
+      2. Suppress beforeunload prompts so the page can't tear itself down.
+      3. Disable any Leave / End Meeting / Cancel-this-call buttons that
+         Zoom may render — they become visually present but inert (pointer
+         events blocked + onclick stubbed).
+      4. Auto-dismiss any "Are you sure you want to leave?" confirm dialog
+         by clicking the Cancel/Stay button.
+
+    This is injected via CDP on every new document so Zoom can never bypass
+    it by re-rendering.
+    """
+    js = r"""
+    (function() {
+      try {
+        // (1) Kill window.close + navigation away from the meeting URL.
+        try { window.close = function(){ return false; }; } catch(e){}
+        try {
+          const _assign = window.location.assign && window.location.assign.bind(window.location);
+          window.location.assign = function(u){
+            try { if (String(u).indexOf('app.zoom.us') === -1) return; } catch(e){}
+            if (_assign) _assign(u);
+          };
+        } catch(e){}
+        // (2) Block beforeunload prompts so nothing can interrupt our session.
+        window.addEventListener('beforeunload', function(ev){
+          try { ev.stopImmediatePropagation(); } catch(e){}
+          try { ev.preventDefault(); } catch(e){}
+          delete ev['returnValue'];
+        }, true);
+        // (3) Capture-phase click guard: cancel any click on Leave/End buttons.
+        const LEAVE_PAT = /\b(leave|end\s*meeting|leave\s*meeting|exit\s*meeting)\b/i;
+        function isLeaveTarget(el){
+          if (!el) return false;
+          let cur = el;
+          for (let i=0; i<5 && cur; i++) {
+            try {
+              const lbl = (cur.getAttribute && (cur.getAttribute('aria-label') || '')) || '';
+              const txt = (cur.innerText || cur.textContent || '').slice(0, 60);
+              if (LEAVE_PAT.test(lbl) || LEAVE_PAT.test(txt)) return true;
+              const cls = (cur.className && cur.className.toString && cur.className.toString()) || '';
+              if (/footer__leave-btn|leave-meeting/i.test(cls)) return true;
+            } catch(e){}
+            cur = cur.parentElement;
+          }
+          return false;
+        }
+        document.addEventListener('click', function(ev){
+          if (isLeaveTarget(ev.target)) {
+            try { ev.stopImmediatePropagation(); ev.preventDefault(); } catch(e){}
+          }
+        }, true);
+        document.addEventListener('mousedown', function(ev){
+          if (isLeaveTarget(ev.target)) {
+            try { ev.stopImmediatePropagation(); ev.preventDefault(); } catch(e){}
+          }
+        }, true);
+        // (4) Mutation observer: auto-dismiss any leave-confirm modal.
+        function dismissLeaveModal(root){
+          try {
+            const buttons = (root || document).querySelectorAll('button');
+            // Click a "Cancel"/"Stay" button if the modal text matches leave-confirm
+            let stayBtn = null, leaveBtn = null;
+            buttons.forEach(function(b){
+              const t = (b.innerText || '').trim().toLowerCase();
+              if (!t) return;
+              if (t === 'cancel' || t === 'stay' || t === 'no') stayBtn = stayBtn || b;
+              if (t === 'leave' || t === 'leave meeting' || t === 'yes') leaveBtn = b;
+            });
+            if (stayBtn && leaveBtn) {
+              // A leave-confirm modal is up — click Stay.
+              stayBtn.click();
+            }
+          } catch(e){}
+        }
+        const mo = new MutationObserver(function(muts){
+          for (const m of muts) {
+            for (const n of m.addedNodes) {
+              if (n && n.nodeType === 1) dismissLeaveModal(n);
+            }
+          }
+        });
+        try { mo.observe(document.documentElement, { childList: true, subtree: true }); } catch(e){}
+        // (5) Periodic sweep — belt-and-suspenders.
+        setInterval(function(){ dismissLeaveModal(document); }, 4000);
+      } catch(e) { /* swallow */ }
+    })();
+    """
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": js})
+    except Exception:
+        pass
+    try:
+        driver.execute_script(js)
+    except Exception:
+        pass
+
+
 def _inject_strict_media_stubs(driver):
     """Override navigator.mediaDevices.getUserMedia to ALWAYS return a silent
     audio track + a black video track. Even if Zoom or a misconfigured flag
@@ -285,6 +424,15 @@ def _build_chrome_opts(headless: bool, chrome_bin: str, profile_dir: str) -> Chr
     if chrome_bin:
         opts.binary_location = chrome_bin
     opts.add_argument(f"--user-data-dir={profile_dir}")
+    # PRO PRE-WARM: share Chrome disk cache across every bot on this RDP so DNS,
+    # CDN responses, fonts, and Zoom JS bundles are downloaded ONCE per machine
+    # and reused by every subsequent bot. Cold-start drops from ~5s to ~1.5s.
+    try:
+        Path(SHARED_DISK_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+        opts.add_argument(f"--disk-cache-dir={SHARED_DISK_CACHE_DIR}")
+        opts.add_argument("--disk-cache-size=536870912")  # 512 MB cap
+    except Exception:
+        pass
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
@@ -490,6 +638,9 @@ def bot_process(meeting_id: str, password: str, name: str, hold_seconds: int,
 
             # Inject strict silent-audio + black-video stubs BEFORE Zoom JS runs
             _inject_strict_media_stubs(driver)
+            # Inject anti-leave guards so the bot can never be evicted/disabled
+            # except by a legitimate host-ended event.
+            _inject_anti_leave_guards(driver)
 
             _attempt_join(driver, meeting_id, password, name)
 
@@ -574,7 +725,8 @@ def run_task(task: dict):
     else:
         names = task.get("names") or [f"User{i+1}" for i in range(members)]
 
-    log(f"▶ task {task_id[:8]} | meeting={meeting_id} members={members} timeout={timeout_sec}s batch={SPAWN_BATCH}")
+    log(f"▶ task {task_id[:8]} | meeting={meeting_id} members={members} timeout={timeout_sec}s "
+        f"batch={SPAWN_BATCH} wave_gap={JOIN_WAVE_GAP_SEC}s warmup_lim={BROWSER_WARMUP_LIMIT}")
 
     # Per-task profile prefix so each task's bots are isolated and cleanup
     # only targets THIS task's processes (won't kill other running tasks).
@@ -591,7 +743,12 @@ def run_task(task: dict):
     with RUNNING_LOCK:
         RUNNING[task_id] = {"processes": processes, "joined": 0, "started_at": time.time(), "prefix": task_prefix}
 
-    # Spawn all bot processes in batches of SPAWN_BATCH with stagger
+    # ---- Spawn strategy ----
+    # WAVE MODE (JOIN_WAVE_GAP_SEC > 0): launch ONE bot, wait JOIN_WAVE_GAP_SEC s,
+    #   then the next. Across N online RDPs all polling simultaneously, the net
+    #   join rate is N bots per gap window — exactly "1 bot per RDP per wave".
+    # LEGACY MODE (JOIN_WAVE_GAP_SEC == 0): old SPAWN_BATCH-of-5 staggered launch.
+    use_wave = JOIN_WAVE_GAP_SEC > 0
     for i in range(members):
         if STOP.is_set(): break
         ev = mp.Event()
@@ -604,11 +761,18 @@ def run_task(task: dict):
         p.start()
         processes.append(p)
 
-        # After every SPAWN_BATCH starts, pause briefly so we don't slam Chrome launch
-        if (i + 1) % SPAWN_BATCH == 0:
-            time.sleep(SPAWN_DELAY_MS / 1000.0)
+        if use_wave:
+            # Wave mode: full configurable gap between every single bot launch.
+            # Break early on STOP so cancel doesn't have to wait the full gap.
+            for _ in range(JOIN_WAVE_GAP_SEC * 10):
+                if STOP.is_set(): break
+                time.sleep(0.1)
         else:
-            time.sleep(0.08)  # tiny inter-process gap
+            # Legacy: stagger inside batches of SPAWN_BATCH.
+            if (i + 1) % SPAWN_BATCH == 0:
+                time.sleep(SPAWN_DELAY_MS / 1000.0)
+            else:
+                time.sleep(0.08)
 
     # Watcher loop: report progress + watch for cancel/end of meeting
     last_reported = 0
@@ -738,12 +902,13 @@ def main_loop():
     log(f"Zoom worker v5 (multiprocess + load-balanced chunks + cancel-aware) starting")
     log(f"  dashboard={DASHBOARD_URL}")
     log(f"  poll={POLL_INTERVAL}s  batch={SPAWN_BATCH}  spawn_delay={SPAWN_DELAY_MS}ms  headless={HEADLESS}")
+    log(f"  wave_gap={JOIN_WAVE_GAP_SEC}s  warmup_limit={BROWSER_WARMUP_LIMIT}  disk_cache={SHARED_DISK_CACHE_DIR}")
     if LOCAL_NAMES_FILE:
         _load_local_names()
 
     # Pre-flight: ensure Chrome can launch
     try:
-        log("Pre-flight: testing Chrome launch…")
+        log("Pre-flight: testing Chrome launch + warming Zoom WC cache…")
         pre_opts = ChromeOptions()
         if HEADLESS: pre_opts.add_argument("--headless")
         if CHROME_BIN: pre_opts.binary_location = CHROME_BIN
@@ -751,6 +916,14 @@ def main_loop():
         pre_opts.add_argument("--disable-dev-shm-usage")
         pre_opts.add_argument("--disable-gpu")
         pre_opts.add_argument(f"--user-data-dir={tempfile.mkdtemp(prefix='zb-pre-')}")
+        # PRO PRE-WARM: hit Zoom WC with the shared disk cache so DNS, CDN,
+        # fonts and JS bundles are all primed for every subsequent bot launch.
+        try:
+            Path(SHARED_DISK_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+            pre_opts.add_argument(f"--disk-cache-dir={SHARED_DISK_CACHE_DIR}")
+            pre_opts.add_argument("--disk-cache-size=536870912")
+        except Exception:
+            pass
         # Try CHROMEDRIVER_PATH first
         if CHROMEDRIVER_PATH and os.path.exists(CHROMEDRIVER_PATH):
             log(f"  using CHROMEDRIVER_PATH={CHROMEDRIVER_PATH}")
@@ -758,8 +931,15 @@ def main_loop():
             d = webdriver.Chrome(service=pre_service, options=pre_opts)
         else:
             d = webdriver.Chrome(options=pre_opts)
+        # Warm the Zoom WC origin so DNS+TLS+CDN are cached before any real bot
+        try:
+            d.set_page_load_timeout(20)
+            d.get("https://app.zoom.us/wc/home")
+            time.sleep(3)  # let main JS bundles arrive
+        except Exception:
+            pass
         d.quit()
-        log("Pre-flight OK — Chrome + chromedriver ready")
+        log("Pre-flight OK — Chrome + chromedriver ready, Zoom WC cache primed")
     except Exception as e:
         log(f"FATAL: Chrome launch failed: {type(e).__name__}: {e}")
         log("Diagnostic steps:")

@@ -10,8 +10,16 @@ const MEETING_TYPES = [
 ];
 
 export default function CreateTaskPanel({ onCreated, variant = "new" }) {
-  const [meetingId, setMeetingId] = useState("");
-  const [password, setPassword] = useState("");
+  // Meeting ID & Password are PERSISTED to localStorage and survive submits,
+  // navigation, and full page reloads — they only clear when the user hits
+  // the explicit "Clear ID/Pwd" button. Per user request: meeting id/password
+  // form field me tab tk rhe jbtk use khud na htaye.
+  const [meetingId, setMeetingId] = useState(() => {
+    try { return localStorage.getItem("zs.meetingId") || ""; } catch { return ""; }
+  });
+  const [password, setPassword] = useState(() => {
+    try { return localStorage.getItem("zs.meetingPwd") || ""; } catch { return ""; }
+  });
   const [members, setMembers] = useState("");
   const [nameSource, setNameSource] = useState("NamesIn");
   const [meetingType, setMeetingType] = useState(MEETING_TYPES[0]);
@@ -27,6 +35,14 @@ export default function CreateTaskPanel({ onCreated, variant = "new" }) {
     { id: "English", name: "English", builtin: true },
   ]);
 
+  // Mirror meetingId / password to localStorage on every change.
+  useEffect(() => {
+    try { localStorage.setItem("zs.meetingId", meetingId); } catch {}
+  }, [meetingId]);
+  useEffect(() => {
+    try { localStorage.setItem("zs.meetingPwd", password); } catch {}
+  }, [password]);
+
   const loadOptions = async () => {
     try {
       const [b, f] = await Promise.all([
@@ -40,11 +56,24 @@ export default function CreateTaskPanel({ onCreated, variant = "new" }) {
 
   useEffect(() => { loadOptions(); }, []);
 
+  // After-submit reset: KEEP meetingId & password (persistent until user
+  // explicitly hits the "Clear ID/Pwd" button). Only members + scheduling
+  // are wiped so the next task can be queued in 1 click.
   const reset = () => {
-    setMeetingId(""); setPassword(""); setMembers("");
+    setMembers("");
     setMeetingType(MEETING_TYPES[0]); setTimeoutSec(7200);
     setFloating(false); setReactions(false);
     setSchedEnabled(false); setSchedAt("");
+  };
+
+  // Full clear including meetingId/password — only fires from the explicit
+  // "Clear ID/Pwd" button.
+  const clearMeeting = () => {
+    setMeetingId(""); setPassword("");
+    try {
+      localStorage.removeItem("zs.meetingId");
+      localStorage.removeItem("zs.meetingPwd");
+    } catch {}
   };
 
   const submit = async (e) => {
@@ -189,6 +218,15 @@ export default function CreateTaskPanel({ onCreated, variant = "new" }) {
         </button>
         <button type="button" onClick={reset} className="zs-btn zs-btn-danger px-6" data-testid="task-cancel-button">
           Cancel
+        </button>
+        <button
+          type="button"
+          onClick={clearMeeting}
+          className="zs-btn px-4 border border-white/15 text-white/80 hover:text-white"
+          title="Clear saved Meeting ID & Password"
+          data-testid="task-clear-meeting-button"
+        >
+          Clear ID/Pwd
         </button>
       </div>
     </form>
