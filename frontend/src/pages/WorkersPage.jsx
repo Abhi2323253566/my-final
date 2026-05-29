@@ -2,11 +2,25 @@ import { useEffect, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import TopBar from "@/components/TopBar";
 import { api, formatApiErrorDetail } from "@/lib/api";
-import { Server, Plus, Trash2, Copy, Cpu, MemoryStick, Activity, X, KeyRound, Download, Pencil, HeartPulse, Zap, AlertTriangle, ShieldCheck } from "lucide-react";
+import { Server, Plus, Trash2, Copy, Cpu, MemoryStick, Activity, X, KeyRound, Download, Pencil, HeartPulse, Zap, AlertTriangle, ShieldCheck, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { useAuth } from "@/auth/AuthContext";
 
 function fmt(iso) { if (!iso) return "never"; try { return new Date(iso).toLocaleString(); } catch { return iso; } }
+
+// "2 min ago" / "1 hr ago" style relative time. Used by the Stability column
+// so the admin can immediately see how recently a flaky RDP last restarted.
+function relTime(iso) {
+  if (!iso) return null;
+  try {
+    const d = new Date(iso);
+    const sec = Math.max(0, (Date.now() - d.getTime()) / 1000);
+    if (sec < 60) return `${Math.floor(sec)}s ago`;
+    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
+    if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+    return `${Math.floor(sec / 86400)}d ago`;
+  } catch { return null; }
+}
 
 export default function WorkersPage() {
   const { user } = useAuth();
@@ -186,7 +200,7 @@ SPAWN_DELAY_MS=400
               <h2 className="text-lg font-semibold text-white">Fleet Health Monitor</h2>
               <span className="text-white/40 text-xs">auto-updates every 8s</span>
             </div>
-            <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
+            <div className="grid grid-cols-2 md:grid-cols-7 gap-3">
               <FleetStat label="Total" value={fleet.summary.total} accent="text-white" testid="fleet-total" />
               <FleetStat
                 label="Healthy"
@@ -214,6 +228,14 @@ SPAWN_DELAY_MS=400
                 value={fleet.summary.offline}
                 accent="text-white/60"
                 testid="fleet-offline"
+              />
+              <FleetStat
+                label="Unstable"
+                value={fleet.summary.unstable ?? 0}
+                accent={(fleet.summary.unstable ?? 0) > 0 ? "text-orange-400" : "text-white/40"}
+                icon={<RefreshCw size={14} />}
+                testid="fleet-unstable"
+                hint={(fleet.summary.unstable ?? 0) > 0 ? "RDPs that have auto-restarted" : "all RDPs stable"}
               />
               <FleetStat
                 label="Utilization"

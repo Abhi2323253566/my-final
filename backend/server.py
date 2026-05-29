@@ -254,6 +254,9 @@ class WorkerOut(BaseModel):
     last_heartbeat: Optional[str] = None
     created_at: str
     pool_stats: Optional[dict] = None  # {browsers, ready_contexts, total_bots, prewarmed}
+    crash_count: int = 0  # cumulative main_loop crashes since worker started (from keep-alive supervisor)
+    last_restart_at: Optional[str] = None  # ISO when keep-alive last restarted main_loop
+    worker_started_at: Optional[str] = None  # ISO when worker process originally booted
 
 
 class WorkerCreatedOut(WorkerOut):
@@ -270,6 +273,9 @@ class HeartbeatIn(BaseModel):
     ram_free_gb: Optional[float] = None
     cpu_count: Optional[int] = None
     pool_stats: Optional[dict] = None  # browser pool prewarm stats from worker
+    crash_count: Optional[int] = None  # cumulative crashes since worker started
+    last_restart_at: Optional[str] = None  # ISO, last main_loop restart
+    worker_started_at: Optional[str] = None  # ISO, worker process boot time
 
 
 class TaskProgressIn(BaseModel):
@@ -612,6 +618,9 @@ def _worker_out(w: dict) -> dict:
         "last_heartbeat": w.get("last_heartbeat"),
         "created_at": w["created_at"],
         "pool_stats": w.get("pool_stats"),
+        "crash_count": int(w.get("crash_count", 0)),
+        "last_restart_at": w.get("last_restart_at"),
+        "worker_started_at": w.get("worker_started_at"),
     }
 
 
@@ -802,6 +811,18 @@ async def worker_heartbeat(payload: HeartbeatIn, w: dict = Depends(get_current_w
     if payload.pool_stats is not None:
         # Pool prewarm telemetry (browsers, ready_contexts, total_bots, prewarmed)
         updates["pool_stats"] = payload.pool_stats
+    # Worker-side keep-alive supervisor telemetry. Monotonic counter that only
+    # ever increases per worker boot; resets when the operator restarts the
+    # script. Lets the dashboard flag unstable RDPs at a glance.
+    if payload.crash_count is not None:
+        updates["crash_count"] = max(0, int(payload.crash_count))
+    if payload.last_restart_at:
+        updates["last_restart_at"] = payload.last_restart_at
+    if payload.worker_started_at:
+        # First heartbeat after a process restart sets this; we keep the
+        # earliest known boot-time (don't overwrite if already set this run).
+        if not w.get("worker_started_at") or w.get("worker_started_at") != payload.worker_started_at:
+            updates["worker_started_at"] = payload.worker_started_at
     await db.workers.update_one({"id": w["id"]}, {"$set": updates})
     w.update(updates)
     return _worker_out(w)
@@ -1717,13 +1738,22 @@ async def admin_fleet_health(_: dict = Depends(get_admin_user)):
             "last_heartbeat": last_hb,
             "heartbeat_age_sec": age,
             "pool_stats": w.get("pool_stats"),
+            "crash_count": int(w.get("crash_count", 0)),
+            "last_restart_at": w.get("last_restart_at"),
+            "worker_started_at": w.get("worker_started_at"),
         })
+
+    # Flag any RDP whose keep-alive supervisor has had to restart main_loop —
+    # zero = perfectly stable, >0 = the operator should investigate even if
+    # the worker is currently 'healthy'.
+    unstable = sum(1 for w in workers if int(w.get("crash_count", 0)) > 0)
 
     return {
         "summary": {
             "total": len(workers),
             "healthy": healthy, "warning": warning,
             "critical": critical, "offline": offline,
+            "unstable": unstable,  # workers with crash_count > 0
             "total_load": total_load, "total_capacity": total_cap,
             "utilization_pct": round((total_load / total_cap * 100), 1) if total_cap else 0.0,
             "prewarm": {

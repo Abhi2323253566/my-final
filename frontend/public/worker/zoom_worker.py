@@ -21,6 +21,7 @@ import tempfile
 import threading
 import traceback
 import multiprocessing as mp
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote
@@ -157,6 +158,13 @@ def _pick_local_names(count: int) -> List[str]:
 
 
 # ---------------- Dashboard API ----------------
+# Globals tracked by the keep-alive supervisor and reported in every heartbeat
+# so the dashboard's Worker-Health panel can flag unstable RDPs.
+WORKER_BOOT_ISO = datetime.now(timezone.utc).isoformat()
+CRASH_COUNT = 0
+LAST_RESTART_ISO: Optional[str] = None
+
+
 def heartbeat(load_override: int = 0):
     if psutil:
         cpu = psutil.cpu_percent(interval=None); ram = psutil.virtual_memory().percent
@@ -164,7 +172,11 @@ def heartbeat(load_override: int = 0):
         cpu, ram = 0.0, 0.0
     payload = {"current_load": load_override, "cpu_pct": float(cpu), "ram_pct": float(ram),
                "hostname": socket.gethostname(),
-               "os_info": f"{sys.platform} (Chrome WC v4-mp)"}
+               "os_info": f"{sys.platform} (Chrome WC v4-mp)",
+               # Keep-alive supervisor telemetry — surfaces RDP stability on the dashboard
+               "crash_count": int(CRASH_COUNT),
+               "last_restart_at": LAST_RESTART_ISO,
+               "worker_started_at": WORKER_BOOT_ISO}
     try:
         requests.post(f"{API}/workers/me/heartbeat", headers=HEADERS, json=payload, timeout=10)
     except Exception as e:
@@ -1082,8 +1094,8 @@ KEEPALIVE_BACKOFF_MAX = int(os.environ.get("KEEPALIVE_BACKOFF_MAX", "30"))
 
 def _supervised_main():
     """Forever-restart wrapper around main_loop. Only exits on STOP signal."""
+    global CRASH_COUNT, LAST_RESTART_ISO
     backoff = KEEPALIVE_BACKOFF_MIN
-    crash_count = 0
     while not STOP.is_set():
         try:
             main_loop()
@@ -1102,18 +1114,19 @@ def _supervised_main():
             # On the very first attempt, propagate so the operator sees it.
             # On subsequent attempts, treat as a crash and keep retrying with
             # backoff — Chrome may have recovered.
-            if crash_count == 0:
+            if CRASH_COUNT == 0:
                 raise
             log(f"main_loop SystemExit({e.code}) — restarting in {backoff}s")
         except Exception:
             log("FATAL in main_loop — full traceback:")
             try: traceback.print_exc()
             except Exception: pass
-        crash_count += 1
+        CRASH_COUNT += 1
+        LAST_RESTART_ISO = datetime.now(timezone.utc).isoformat()
         # Try to clean up any orphan chromes before restart
         try: kill_orphans()
         except Exception: pass
-        log(f"keep-alive: main_loop crashed (#{crash_count}) — sleeping {backoff}s then restarting")
+        log(f"keep-alive: main_loop crashed (#{CRASH_COUNT}) — sleeping {backoff}s then restarting")
         # Sleep in 1s chunks so SIGINT is responsive
         for _ in range(backoff):
             if STOP.is_set(): break
