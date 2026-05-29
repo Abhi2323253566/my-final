@@ -341,8 +341,12 @@ BUILTIN_NAMES = {
 @api.post("/auth/login", response_model=UserOut)
 async def login(payload: LoginIn, response: Response, request: Request):
     email = payload.email.lower().strip()
-    ip = request.client.host if request.client else "x"
-    identifier = f"{ip}:{email}"
+    # Behind a load balancer / K8s ingress the direct connection is the LB,
+    # so request.client.host is the same for every user → one failure locks
+    # everyone out. Prefer the real client IP from X-Forwarded-For / X-Real-IP.
+    xff = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip") or ""
+    real_ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "x")
+    identifier = f"{real_ip}:{email}"
 
     # brute force gate
     lock = await db.login_attempts.find_one({"identifier": identifier})
