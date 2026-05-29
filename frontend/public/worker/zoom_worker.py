@@ -165,139 +165,263 @@ def complete_task(task_id: str, success: bool, joined: int, error: Optional[str]
 
 
 # ---------------- Bot subprocess ----------------
+# Phrases that indicate the meeting has ended OR the bot has been kicked out.
+# When detected, we stop the force-stay loop (no point reconnecting).
+_END_PHRASES = (
+    "meeting has ended",
+    "meeting has been ended",
+    "host has ended this meeting",
+    "this meeting has ended",
+    "you have been removed",
+    "removed from the meeting",
+    "meeting is locked",
+    "ended by host",
+)
+
+# Reconnect tuning (overridable via env)
+RECONNECT_MAX_ATTEMPTS = int(os.environ.get("RECONNECT_MAX_ATTEMPTS", "5"))
+RECONNECT_DELAY_SEC    = int(os.environ.get("RECONNECT_DELAY_SEC", "5"))
+
+
+def _build_chrome_opts(headless: bool, chrome_bin: str, profile_dir: str) -> ChromeOptions:
+    opts = ChromeOptions()
+    if headless:
+        opts.add_argument("--headless")
+    if chrome_bin:
+        opts.binary_location = chrome_bin
+    opts.add_argument(f"--user-data-dir={profile_dir}")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--mute-audio")  # chrome-level audio mute
+    opts.add_argument("--window-size=1280,720")
+    # Fake-device flags keep Zoom from blocking the join because of "no
+    # mic/cam". The fake device is a black frame + silence — exactly what
+    # we want a "silent muted bot" to broadcast. We additionally click the
+    # pre-join Mute/Stop-Video toggles, so the bot also *appears* muted &
+    # camera-off to the host.
+    opts.add_argument("--use-fake-ui-for-media-stream")
+    opts.add_argument("--use-fake-device-for-media-stream")
+    opts.add_argument("--autoplay-policy=no-user-gesture-required")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--disable-notifications")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-default-apps")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--disable-sync")
+    opts.add_argument("--disable-translate")
+    opts.add_argument("--log-level=3")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_experimental_option("prefs", {
+        # 1 = allow (fake device is plugged via flags above) — needed so the
+        # Zoom client doesn't sit on a permission prompt.
+        "profile.default_content_setting_values.media_stream_mic": 1,
+        "profile.default_content_setting_values.media_stream_camera": 1,
+        "profile.default_content_setting_values.notifications": 2,
+        "profile.managed_default_content_settings.images": 2,  # save CPU/RAM
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+    })
+    return opts
+
+
+def _start_driver(opts: ChromeOptions):
+    """Resolve chromedriver via CHROMEDRIVER_PATH → Selenium Manager → default."""
+    driver_path = os.environ.get("CHROMEDRIVER_PATH", "").strip()
+    try:
+        if driver_path and os.path.exists(driver_path):
+            service = ChromeService(executable_path=driver_path, log_path=os.devnull)
+            return webdriver.Chrome(service=service, options=opts)
+        return webdriver.Chrome(options=opts)
+    except Exception:
+        return webdriver.Chrome(service=ChromeService(), options=opts)
+
+
+def _toggle_off_pre_join_media(driver, name: str):
+    """On the Zoom WC preview screen, toggle Mute + Stop-Video BEFORE clicking Join.
+
+    Zoom WC uses two buttons whose aria-pressed flips between the two states.
+    We treat the absence of "unmute"/"start" in the aria-label as "currently
+    live" and click to turn it off.
+    """
+    # --- Audio: click "Mute" if currently unmuted ---
+    audio_selectors = [
+        "button#preview-audio-control-button",
+        "button[aria-label*='mute my microphone' i]",
+        "button[aria-label*='mute' i][aria-label*='microphone' i]",
+    ]
+    for sel in audio_selectors:
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, sel)
+            lbl = (btn.get_attribute("aria-label") or "").lower()
+            # If label says "unmute" → already muted, skip. Else click to mute.
+            if "unmute" not in lbl:
+                driver.execute_script("arguments[0].click();", btn)
+            break
+        except Exception:
+            continue
+
+    # --- Video: click "Stop Video" if currently on ---
+    video_selectors = [
+        "button#preview-video-control-button",
+        "button[aria-label*='stop my video' i]",
+        "button[aria-label*='turn off my video' i]",
+    ]
+    for sel in video_selectors:
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, sel)
+            lbl = (btn.get_attribute("aria-label") or "").lower()
+            # If label says "start"/"turn on" → already off, skip. Else click off.
+            if not ("start" in lbl or "turn on" in lbl):
+                driver.execute_script("arguments[0].click();", btn)
+            break
+        except Exception:
+            continue
+
+
+def _enforce_in_meeting_media_off(driver):
+    """After joining, defensively click in-meeting Mute + Stop-Video controls."""
+    # Mute mic if currently unmuted
+    try:
+        mic_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label*='mute my microphone' i]")
+        lbl = (mic_btn.get_attribute("aria-label") or "").lower()
+        if "unmute" not in lbl:
+            driver.execute_script("arguments[0].click();", mic_btn)
+    except Exception:
+        pass
+    # Stop video if currently on
+    try:
+        vid_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label*='stop my video' i]")
+        driver.execute_script("arguments[0].click();", vid_btn)
+    except Exception:
+        pass
+
+
+def _meeting_has_ended(driver) -> bool:
+    """Detect host-ended / kicked-out states by scanning the page body text."""
+    try:
+        body_txt = (driver.find_element(By.TAG_NAME, "body").text or "").lower()
+    except Exception:
+        return False
+    return any(phrase in body_txt for phrase in _END_PHRASES)
+
+
+def _attempt_join(driver, meeting_id: str, password: str, name: str) -> bool:
+    """Run the full join sequence. Returns True if we *think* we're in the meeting."""
+    driver.set_page_load_timeout(60)
+    driver.get(f"https://app.zoom.us/wc/{meeting_id}/join")
+    time.sleep(5)  # let Zoom's JS finish initial render
+
+    wait = WebDriverWait(driver, 20)
+
+    # Password input (only if a password was provided)
+    if password:
+        try:
+            pwd_el = wait.until(EC.presence_of_element_located(
+                (By.XPATH, "//input[@id='input-for-pwd']")))
+            pwd_el.clear(); pwd_el.send_keys(password)
+        except TimeoutException:
+            pass  # no pwd field — meeting may not require one
+
+    # Name input
+    name_el = wait.until(EC.presence_of_element_located(
+        (By.XPATH, "//input[@id='input-for-name']")))
+    name_el.clear(); name_el.send_keys(name)
+
+    # [CRITICAL] Toggle Mute + Stop-Video on the PRE-JOIN screen, so we enter
+    # the meeting already muted with camera off — host never sees a live frame.
+    _toggle_off_pre_join_media(driver, name)
+
+    # Join button — JS click (more reliable than .click())
+    join_btn = wait.until(EC.element_to_be_clickable(
+        (By.XPATH, "//button[contains(@class,'preview-join-button')]")))
+    driver.execute_script("arguments[0].click();", join_btn)
+
+    # Wait until in meeting room (or waiting room)
+    try:
+        WebDriverWait(driver, 35).until(EC.any_of(
+            EC.presence_of_element_located((By.CSS_SELECTOR, ".meeting-app, .meeting-client, .footer__leave-btn")),
+            EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Leave')]")),
+            EC.presence_of_element_located((By.XPATH, "//*[contains(text(),'Please wait') or contains(text(),'Waiting Room')]")),
+        ))
+    except TimeoutException:
+        pass  # may still be in form; declare joined anyway
+
+    # Defensive in-meeting media-off (safety net on top of pre-join toggle)
+    time.sleep(1.5)
+    _enforce_in_meeting_media_off(driver)
+    return True
+
+
 # This runs in its OWN process (mp.Process) — fully isolated Chrome + Selenium
 def bot_process(meeting_id: str, password: str, name: str, hold_seconds: int,
                 headless: bool, chrome_bin: str, joined_event: 'mp.synchronize.Event',
                 task_prefix: str = ""):
-    """Single bot — join Zoom meeting and stay until hold_seconds or terminated."""
+    """Single bot — join Zoom meeting muted & camera off, force-stay until the
+    host ends the meeting OR ``hold_seconds`` budget runs out. On unexpected
+    disconnects (driver crash, transient network), the bot transparently
+    rebuilds Chrome and rejoins (up to ``RECONNECT_MAX_ATTEMPTS`` times).
+    """
     import tempfile as _tf
-    # Per-task profile prefix so kill_orphans() can avoid killing OTHER tasks' bots
     pfx = f"zb-{task_prefix}-" if task_prefix else "zb-"
-    profile_dir = _tf.mkdtemp(prefix=pfx)
-    driver = None
-    try:
-        opts = ChromeOptions()
-        if headless:
-            opts.add_argument("--headless")
-        if chrome_bin:
-            opts.binary_location = chrome_bin
-        opts.add_argument(f"--user-data-dir={profile_dir}")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--mute-audio")
-        opts.add_argument("--window-size=1280,720")
-        opts.add_argument("--use-fake-ui-for-media-stream")
-        opts.add_argument("--use-fake-device-for-media-stream")
-        opts.add_argument("--autoplay-policy=no-user-gesture-required")
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_argument("--disable-notifications")
-        opts.add_argument("--disable-extensions")
-        opts.add_argument("--disable-default-apps")
-        opts.add_argument("--no-first-run")
-        opts.add_argument("--disable-sync")
-        opts.add_argument("--disable-translate")
-        opts.add_argument("--log-level=3")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        opts.add_experimental_option("prefs", {
-            "profile.default_content_setting_values.media_stream_mic": 1,
-            "profile.default_content_setting_values.media_stream_camera": 1,
-            "profile.default_content_setting_values.notifications": 2,
-            "credentials_enable_service": False,
-            "profile.password_manager_enabled": False,
-        })
 
-        # Driver resolution priority:
-        # 1. Explicit CHROMEDRIVER_PATH env var (most reliable, user-provided)
-        # 2. Selenium Manager auto-resolve
-        # 3. Basic Service() fallback
-        driver_path = os.environ.get("CHROMEDRIVER_PATH", "").strip()
+    deadline = time.time() + hold_seconds  # hard ceiling regardless of reconnects
+    attempts = 0
+    meeting_naturally_ended = False
+
+    while time.time() < deadline and attempts < RECONNECT_MAX_ATTEMPTS:
+        attempts += 1
+        profile_dir = _tf.mkdtemp(prefix=pfx)
+        driver = None
         try:
-            if driver_path and os.path.exists(driver_path):
-                service = ChromeService(executable_path=driver_path, log_path=os.devnull)
-                driver = webdriver.Chrome(service=service, options=opts)
+            opts = _build_chrome_opts(headless, chrome_bin, profile_dir)
+            driver = _start_driver(opts)
+
+            _attempt_join(driver, meeting_id, password, name)
+
+            # Signal "joined" to parent on FIRST successful attempt only
+            if not joined_event.is_set():
+                joined_event.set()
+
+            # ---- Force-stay loop: poll every 15s ----
+            while time.time() < deadline:
+                time.sleep(15)
+                # Liveness probe — raises if driver died
+                try:
+                    _ = driver.title
+                except Exception:
+                    # Driver dead → break to outer reconnect loop
+                    break
+                # Did the host end the meeting / kick us out?
+                if _meeting_has_ended(driver):
+                    meeting_naturally_ended = True
+                    break
             else:
-                driver = webdriver.Chrome(options=opts)
-        except Exception:
-            service = ChromeService()
-            driver = webdriver.Chrome(service=service, options=opts)
+                # Loop fell through because deadline hit
+                meeting_naturally_ended = False
 
-        driver.set_page_load_timeout(60)
-        driver.get(f"https://app.zoom.us/wc/{meeting_id}/join")
-        time.sleep(5)  # critical: let Zoom's JS finish initial render
+            if meeting_naturally_ended:
+                break  # exit outer reconnect loop — work done
 
-        wait = WebDriverWait(driver, 20)
-
-        # Password input (only if password provided)
-        if password:
+        except Exception as e:
+            try: print(f"[bot {name}] attempt {attempts} error: {type(e).__name__}: {str(e)[:140]}", flush=True)
+            except Exception: pass
+        finally:
             try:
-                pwd_el = wait.until(EC.presence_of_element_located(
-                    (By.XPATH, "//input[@id='input-for-pwd']")))
-                pwd_el.clear(); pwd_el.send_keys(password)
-            except TimeoutException:
-                # No password field — meeting may not require one
-                pass
+                if driver: driver.quit()
+            except Exception: pass
+            shutil.rmtree(profile_dir, ignore_errors=True)
 
-        # Name input
-        name_el = wait.until(EC.presence_of_element_located(
-            (By.XPATH, "//input[@id='input-for-name']")))
-        name_el.clear(); name_el.send_keys(name)
-
-        # Join button — JS click (more reliable than .click())
-        join_btn = wait.until(EC.element_to_be_clickable(
-            (By.XPATH, "//button[contains(@class,'preview-join-button')]")))
-        driver.execute_script("arguments[0].click();", join_btn)
-
-        # Wait until in meeting room (one of these indicators must appear)
-        try:
-            WebDriverWait(driver, 35).until(EC.any_of(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".meeting-app, .meeting-client, .footer__leave-btn")),
-                EC.presence_of_element_located((By.XPATH, "//button[contains(., 'Leave')]")),
-                EC.presence_of_element_located((By.XPATH, "//*[contains(text(),'Please wait') or contains(text(),'Waiting Room')]")),
-            ))
-        except TimeoutException:
-            pass  # may still be in form; declare joined anyway
-
-        # Signal joined to parent process
-        joined_event.set()
-
-        # Try to auto-mute mic after 1.5 sec (best effort)
-        time.sleep(1.5)
-        try:
-            mic_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label*='mute my microphone' i]")
-            lbl = (mic_btn.get_attribute("aria-label") or "").lower()
-            if "unmute" not in lbl:
-                driver.execute_script("arguments[0].click();", mic_btn)
-        except Exception:
-            pass
-
-        # Try to auto-stop video (best effort) — if "Stop my video" is visible,
-        # click it. If only "Start my video" is visible, video is already off.
-        try:
-            vid_btn = driver.find_element(By.CSS_SELECTOR, "button[aria-label*='stop my video' i]")
-            driver.execute_script("arguments[0].click();", vid_btn)
-        except Exception:
-            pass
-
-        # Hold the bot in the meeting
-        end = time.time() + hold_seconds
-        while time.time() < end:
-            time.sleep(20)
-            try:
-                _ = driver.title  # liveness probe
-            except Exception:
-                break
-
-    except Exception as e:
-        # Quiet — parent process tracks failures via joined_event timeout
-        try: print(f"[bot {name}] error: {type(e).__name__}: {str(e)[:120]}", flush=True)
-        except Exception: pass
-    finally:
-        try:
-            if driver: driver.quit()
-        except Exception: pass
-        shutil.rmtree(profile_dir, ignore_errors=True)
+        # Reached here → driver died OR exception. If we still have time budget
+        # AND meeting hasn't ended naturally, reconnect after a short pause.
+        if meeting_naturally_ended or time.time() >= deadline:
+            break
+        if attempts < RECONNECT_MAX_ATTEMPTS:
+            try: print(f"[bot {name}] reconnecting in {RECONNECT_DELAY_SEC}s "
+                       f"(attempt {attempts + 1}/{RECONNECT_MAX_ATTEMPTS})", flush=True)
+            except Exception: pass
+            time.sleep(RECONNECT_DELAY_SEC)
 
 
 # ---------------- Task runner ----------------
