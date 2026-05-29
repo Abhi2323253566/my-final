@@ -62,9 +62,12 @@ fi
 # Apache remove
 apt-get remove -y --purge apache2 apache2-utils apache2-bin 2>/dev/null || true
 
-# nginx vhosts
+# nginx vhosts (purane sab hata do — port 8000 wala bhi)
 rm -f /etc/nginx/sites-enabled/* 2>/dev/null || true
-rm -f "/etc/nginx/sites-available/${APP_NAME}" 2>/dev/null || true
+rm -f /etc/nginx/sites-available/finalzoom* 2>/dev/null || true
+rm -f /etc/nginx/sites-available/zoom* 2>/dev/null || true
+rm -f /etc/nginx/sites-available/default 2>/dev/null || true
+rm -f /etc/nginx/conf.d/*.conf 2>/dev/null || true
 
 # Old app dirs
 rm -rf /opt/finalzoom /opt/zoom /var/www/finalzoom /var/www/zoom /root/finalzoom-main 2>/dev/null || true
@@ -160,12 +163,21 @@ EOF
 chmod 600 "${APP_DIR}/backend/.env"
 chown "${APP_USER}:${APP_USER}" "${APP_DIR}/backend/.env"
 
+# Strip Emergent-internal packages (not on public PyPI)
+sed -i '/^emergentintegrations/d' "${APP_DIR}/backend/requirements.txt"
+
 sudo -u "${APP_USER}" "${PYBIN}" -m venv "${APP_DIR}/.venv"
 sudo -u "${APP_USER}" bash -c "
   source '${APP_DIR}/.venv/bin/activate' && \
   pip install --upgrade pip wheel setuptools && \
   pip install -r '${APP_DIR}/backend/requirements.txt'
-"
+" || { echo '!! Python deps install FAILED'; exit 1; }
+
+# Optional: try Emergent's private index (won't fail script if unavailable)
+sudo -u "${APP_USER}" bash -c "
+  source '${APP_DIR}/.venv/bin/activate' && \
+  pip install emergentintegrations --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/ 2>/dev/null
+" || echo ">> (info) emergentintegrations skipped — not required for this app"
 
 # ====== 7. FRONTEND BUILD =====================================================
 echo ">> [7/10] Building frontend..."
@@ -178,11 +190,13 @@ chown "${APP_USER}:${APP_USER}" "${APP_DIR}/frontend/.env"
 sudo -u "${APP_USER}" bash -c "
   cd '${APP_DIR}/frontend' && \
   yarn install --network-timeout 600000
-"
+" || { echo '!! yarn install FAILED'; exit 1; }
 sudo -u "${APP_USER}" bash -c "
   cd '${APP_DIR}/frontend' && \
   CI=false NODE_OPTIONS=--max-old-space-size=2048 yarn build
-"
+" || { echo '!! yarn build FAILED'; exit 1; }
+
+[[ -f "${APP_DIR}/frontend/build/index.html" ]] || { echo "!! Frontend build directory missing"; exit 1; }
 
 # ====== 8. SYSTEMD UNIT =======================================================
 echo ">> [8/10] Creating systemd unit..."
@@ -276,8 +290,16 @@ echo "==================================================================="
 echo " STATUS"
 systemctl --no-pager --lines=0 status "${APP_NAME}-backend" || true
 echo "-------------------------------------------------------------------"
-curl -sS -o /dev/null -w "  Backend local : HTTP %{http_code}\n" "http://127.0.0.1:${BACKEND_PORT}/api/" || true
-curl -sS -o /dev/null -w "  HTTPS  domain : HTTP %{http_code}\n" "https://${DOMAIN}/" || true
+BE_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${BACKEND_PORT}/api/" || echo "000")
+HTTPS_CODE=$(curl -sS -o /dev/null -w "%{http_code}" "https://${DOMAIN}/" || echo "000")
+echo "  Backend local : HTTP ${BE_CODE}"
+echo "  HTTPS  domain : HTTP ${HTTPS_CODE}"
+
+if [[ "${BE_CODE}" == "000" ]] || [[ "${BE_CODE}" == "502" ]]; then
+  echo
+  echo "!! Backend not responding. Last 40 error lines:"
+  tail -n 40 "/var/log/${APP_NAME}-backend.err.log" 2>/dev/null || journalctl -u "${APP_NAME}-backend" --no-pager -n 40
+fi
 echo "==================================================================="
 echo
 echo " DEPLOYMENT COMPLETE"
@@ -291,3 +313,4 @@ echo "   sudo tail -f /var/log/${APP_NAME}-backend.err.log"
 echo "   (code update)  cd ${APP_DIR} && sudo -u ${APP_USER} git pull && sudo systemctl restart ${APP_NAME}-backend"
 echo "   (rebuild fe)   cd ${APP_DIR}/frontend && sudo -u ${APP_USER} yarn build && sudo systemctl reload nginx"
 echo "==================================================================="
+
