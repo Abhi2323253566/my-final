@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ###############################################################################
 # FinalZoom — GitHub One-Shot Installer
-# Repo: https://github.com/tradeg847-stack/finalzoom.git
+# Repo: https://github.com/Abhi2323253566/my-final.git
 #
 # - Purana sab band (pm2, docker, apache, nginx vhosts, port 80/443/8001)
 # - Fresh clone + MongoDB7 + Redis + Nginx + Python3.11 + Node20
@@ -272,7 +272,7 @@ server {
     }
 
     location /api/ {
-        proxy_pass         https://afiinitysoftware.com:${BACKEND_PORT};
+        proxy_pass         http://127.0.0.1:${BACKEND_PORT};
         proxy_http_version 1.1;
         proxy_set_header   Host \$host;
         proxy_set_header   X-Real-IP \$remote_addr;
